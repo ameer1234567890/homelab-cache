@@ -269,6 +269,23 @@ NO_PROXY=localhost,127.0.0.1
 
 If that proxy inspects TLS, put its root certificate (PEM) in `certs/upstream/` so the cache trusts it.
 
+### udocker on Termux (Android)
+
+[udocker](https://github.com/indigo-dc/udocker) runs without root and has no system-wide DNS or certificate store to configure, so point its downloads at the cache through curl instead. Add these lines to `~/.curlrc`, replacing the address with your cache host's IP:
+
+```
+resolve registry-1.docker.io:443:192.168.88.11
+insecure
+```
+
+`resolve` sends Docker Hub requests to the cache, and `insecure` tells curl to accept the cache's certificate without verifying it. Then pull as usual:
+
+```bash
+udocker pull alpine
+```
+
+Add one `resolve` line per registry you want cached, for example `resolve ghcr.io:443:192.168.88.11`. Note that `insecure` applies to every curl command run by that user, not only udocker, so remove the file (or the two lines) when you no longer want it.
+
 ### Undo
 
 Remove the DNS records or hosts line, and the certificate from the trust store (delete the file you copied, then run `sudo update-ca-certificates --fresh` or `sudo update-ca-trust`). Pulls go straight to the real registries again.
