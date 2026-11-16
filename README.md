@@ -21,7 +21,7 @@ A web UI (plain HTTP on `:8080`, and over TLS on any other name or IP) shows cac
 ```bash
 cp .env.example .env
 mkdir -p certs && cp /path/to/server.crt /path/to/server.key certs/   # your certificate, see below
-docker compose up -d        # pulls ameer1234567890/homelab-cache from Docker Hub
+docker compose up -d        # pulls ameer1234567890/homelab-cache from Docker Hub (also on ghcr.io)
 ```
 
 Open `http://<host>:8080`. The **Connect a client** button gives commands for your actual hostnames. Then follow [Client setup](#client-setup-system-wide).
@@ -29,6 +29,8 @@ Open `http://<host>:8080`. The **Connect a client** button gives commands for yo
 ## The image
 
 `docker-compose.yml` runs the image named by `REGISTRY_IMAGE` (default `ameer1234567890/homelab-cache:latest`). Pin a version tag such as `:1.0.0` in `.env` if you want upgrades to be deliberate, then `docker compose pull && docker compose up -d` to move to a new one. Your certificate, credentials, registry list and cached data are all supplied at run time, so nothing private is inside the image.
+
+The same image is also published to the GitHub Container Registry. To pull from there instead, set `REGISTRY_IMAGE=ghcr.io/ameer1234567890/homelab-cache:latest` in `.env`. If the package is not public yet, make it so under the repository's Packages settings (or `docker login ghcr.io` first).
 
 ### Building it from source
 
@@ -53,6 +55,8 @@ For both Intel/AMD and ARM machines, build multi-architecture and push in one st
 docker buildx build --platform linux/amd64,linux/arm64 \
   -t ameer1234567890/homelab-cache:latest -t ameer1234567890/homelab-cache:1.0.0 --push .
 ```
+
+The GitHub Actions workflow (`.github/workflows/build.yml`) does this automatically for every pushed tag, publishing multi-architecture images to both Docker Hub and `ghcr.io/ameer1234567890/homelab-cache`. Docker Hub needs the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets; ghcr.io uses the built-in `GITHUB_TOKEN`, so it needs no setup. You can also run the workflow by hand from the Actions tab and give it a tag name.
 
 `.dockerignore` keeps `.env`, `credentials.env`, `certs/` and `data/` out of the build, so they cannot end up in a published layer.
 
