@@ -26,7 +26,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ameer1234567890/docker-registry-cache
+          images: ameer1234567890/homelab-cache
           tags: type=semver,pattern={{version}}
       -
         name: Set up QEMU

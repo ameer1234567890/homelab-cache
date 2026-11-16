@@ -1,4 +1,4 @@
-# docker-registry-cache
+# homelab-cache
 
 A self-hosted, transparent pull-through cache for container registries, in **one container on port 443**. Clients keep using the real image names; the cache is chosen by the registry's hostname.
 
@@ -21,19 +21,19 @@ A web UI (plain HTTP on `:8080`, and over TLS on any other name or IP) shows cac
 ```bash
 cp .env.example .env
 mkdir -p certs && cp /path/to/server.crt /path/to/server.key certs/   # your certificate, see below
-docker compose up -d        # pulls ameer1234567890/docker-registry-cache from Docker Hub
+docker compose up -d        # pulls ameer1234567890/homelab-cache from Docker Hub
 ```
 
 Open `http://<host>:8080`. The **Connect a client** button gives commands for your actual hostnames. Then follow [Client setup](#client-setup-system-wide).
 
 ## The image
 
-`docker-compose.yml` runs the image named by `REGISTRY_IMAGE` (default `ameer1234567890/docker-registry-cache:latest`). Pin a version tag such as `:1.0.0` in `.env` if you want upgrades to be deliberate, then `docker compose pull && docker compose up -d` to move to a new one. Your certificate, credentials, registry list and cached data are all supplied at run time, so nothing private is inside the image.
+`docker-compose.yml` runs the image named by `REGISTRY_IMAGE` (default `ameer1234567890/homelab-cache:latest`). Pin a version tag such as `:1.0.0` in `.env` if you want upgrades to be deliberate, then `docker compose pull && docker compose up -d` to move to a new one. Your certificate, credentials, registry list and cached data are all supplied at run time, so nothing private is inside the image.
 
 ### Building it from source
 
 ```bash
-docker build -t ameer1234567890/docker-registry-cache:latest .
+docker build -t ameer1234567890/homelab-cache:latest .
 docker compose up -d
 ```
 
@@ -43,15 +43,15 @@ Docker Compose only pulls an image when it is not already on the machine, so aft
 
 ```bash
 docker login
-docker build -t ameer1234567890/docker-registry-cache:latest -t ameer1234567890/docker-registry-cache:1.0.0 .
-docker push --all-tags ameer1234567890/docker-registry-cache
+docker build -t ameer1234567890/homelab-cache:latest -t ameer1234567890/homelab-cache:1.0.0 .
+docker push --all-tags ameer1234567890/homelab-cache
 ```
 
 For both Intel/AMD and ARM machines, build multi-architecture and push in one step:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -t ameer1234567890/docker-registry-cache:latest -t ameer1234567890/docker-registry-cache:1.0.0 --push .
+  -t ameer1234567890/homelab-cache:latest -t ameer1234567890/homelab-cache:1.0.0 --push .
 ```
 
 `.dockerignore` keeps `.env`, `credentials.env`, `certs/` and `data/` out of the build, so they cannot end up in a published layer.
@@ -383,7 +383,7 @@ Set in `.env` (see `.env.example`).
 
 | Variable                       | Default            | Purpose                                                                  |
 | ------------------------------ | ------------------ | ------------------------------------------------------------------------ |
-| `REGISTRY_IMAGE`               | `ameer1234567890/docker-registry-cache:latest` | The image to run                                   |
+| `REGISTRY_IMAGE`               | `ameer1234567890/homelab-cache:latest` | The image to run                                   |
 | `BIND_ADDR`                    | `0.0.0.0`          | Interface the cache listens on (port 443)                                |
 | `UI_PORT`                      | `8080`             | Plain-HTTP web UI                                                        |
 | `UPSTREAM_DNS`, `UPSTREAM_DNS_2` | `1.1.1.1`, `8.8.8.8` | Resolvers the cache uses to reach the real registries (see warning below) |
@@ -440,8 +440,8 @@ The image is now built on registry 3, which may print different start-up message
 ## Maintenance
 
 - **Clear a registry or the whole cache:** use the delete buttons in the UI. From the command line: `docker compose stop && rm -rf data/ghcr/docker && docker compose start`.
-- **Reclaim space from removed manifests:** `docker compose exec docker-registry-cache registry garbage-collect /run/registry/hub.yml`
-- **Logs:** `docker compose logs -f docker-registry-cache`
+- **Reclaim space from removed manifests:** `docker compose exec homelab-cache registry garbage-collect /run/registry/hub.yml`
+- **Logs:** `docker compose logs -f homelab-cache`
 
 ## Limitations
 

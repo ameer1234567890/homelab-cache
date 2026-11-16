@@ -1209,7 +1209,7 @@ def snapshot(wait_for=None):
 
 # --------------------------------------------------------------------------- http
 class Handler(BaseHTTPRequestHandler):
-    server_version = "registry-cache-ui"
+    server_version = "homelab-cache-ui"
 
     def log_message(self, fmt, *args):  # keep container logs quiet
         pass
@@ -1338,7 +1338,7 @@ def main():
     start_scan(force=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     limit = f", size limit {fmt_bytes(MAX_BYTES)}" if MAX_BYTES else ""
-    print(f"registry-cache UI listening on :{PORT}, data={DATA_DIR}{limit}, "
+    print(f"homelab-cache UI listening on :{PORT}, data={DATA_DIR}{limit}, "
           f"delete={'on' if ALLOW_DELETE else 'off'}{' (token required)' if ADMIN_TOKEN else ''}", flush=True)
     server.serve_forever()
 

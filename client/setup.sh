@@ -1,5 +1,5 @@
 #!/bin/sh
-# docker-registry-cache: client setup (Linux and macOS)
+# homelab-cache: client setup (Linux and macOS)
 #
 # Points the registry names (ghcr.io, quay.io, ...) at the cache by adding them to /etc/hosts, and trusts the
 # cache's root certificate so TLS to those names validates. Safe to run again; undo with --remove.
@@ -26,10 +26,10 @@ case "$DEFAULT_URL" in @@*) DEFAULT_URL='' ;; esac
 # DRC_PREFIX relocates every system path (for packaging and tests); it is not needed in normal use.
 PREFIX="${DRC_PREFIX:-}"
 HOSTS_FILE="$PREFIX/etc/hosts"
-MANIFEST="$PREFIX/etc/docker-registry-cache-client.paths"
-MARK_BEGIN='# BEGIN docker-registry-cache'
-MARK_END='# END docker-registry-cache'
-CERT_NAME='docker-registry-cache.crt'
+MANIFEST="$PREFIX/etc/homelab-cache-client.paths"
+MARK_BEGIN='# BEGIN homelab-cache'
+MARK_END='# END homelab-cache'
+CERT_NAME='homelab-cache.crt'
 
 MODE=install
 ADDR='' URL='' HOSTS='' CA_ARG='' PIN=''
@@ -202,7 +202,7 @@ verify() {
 
 # ------------------------------------------------------------------ --check
 if [ "$MODE" = check ]; then
-  step "docker-registry-cache client check"
+  step "homelab-cache client check"
   if [ -f "$HOSTS_FILE" ] && grep -qxF "$MARK_BEGIN" "$HOSTS_FILE"; then
     ok "hosts entries from this script are present"
     IP=$(awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0==b{f=1;next} $0==e{f=0} f&&$1!~/^#/{print $1; exit}' "$HOSTS_FILE")
@@ -215,10 +215,10 @@ fi
 
 # ------------------------------------------------------------------ --remove
 if [ "$MODE" = remove ]; then
-  step "Removing docker-registry-cache client setup"
+  step "Removing homelab-cache client setup"
   [ "$DRY" = 1 ] && say "  (dry run: nothing will be changed)"
   if [ "$NO_HOSTS" = 0 ] && [ -f "$HOSTS_FILE" ] && grep -qxF "$MARK_BEGIN" "$HOSTS_FILE"; then
-    if [ "$DRY" = 1 ]; then say "  would remove the docker-registry-cache block from $HOSTS_FILE"
+    if [ "$DRY" = 1 ]; then say "  would remove the homelab-cache block from $HOSTS_FILE"
     else strip_block "$HOSTS_FILE" > "$TMP/hosts.new"; cat "$TMP/hosts.new" > "$HOSTS_FILE"; ok "removed the block from $HOSTS_FILE"; fi
   else
     say "  no hosts entries to remove"
@@ -230,7 +230,7 @@ if [ "$MODE" = remove ]; then
       if [ -e "$path" ]; then
         if [ "$DRY" = 1 ]; then say "  would delete $path"
         else
-          if [ "$OS" = Darwin ] && [ "$(basename "$path")" = ca.crt ] && [ "$(basename "$(dirname "$path")")" = docker-registry-cache ] && command -v security >/dev/null 2>&1; then
+          if [ "$OS" = Darwin ] && [ "$(basename "$path")" = ca.crt ] && [ "$(basename "$(dirname "$path")")" = homelab-cache ] && command -v security >/dev/null 2>&1; then
             sha1=$(openssl x509 -in "$path" -noout -fingerprint -sha1 2>/dev/null | sed 's/^.*=//; s/://g')
             security remove-trusted-cert -d "$path" 2>/dev/null || true
             [ -n "$sha1" ] && security delete-certificate -Z "$sha1" /Library/Keychains/System.keychain 2>/dev/null || true
@@ -254,7 +254,7 @@ if [ "$MODE" = remove ]; then
 fi
 
 # ------------------------------------------------------------------ install
-step "docker-registry-cache client setup"
+step "homelab-cache client setup"
 [ "$DRY" = 1 ] && say "  (dry run: nothing will be changed)"
 [ "$NO_HOSTS" = 1 ] && [ "$NO_TRUST" = 1 ] && { say "  --no-hosts and --no-trust together leave nothing to do."; exit 0; }
 
@@ -321,15 +321,15 @@ if [ "$NO_HOSTS" = 0 ]; then
       warn "$h is also set elsewhere in $HOSTS_FILE. The first matching line wins, so check that it points at the cache."
     fi
   done
-  { cat "$TMP/hosts.base"; echo "$MARK_BEGIN"; echo "# managed by docker-registry-cache setup; undo with --remove"
+  { cat "$TMP/hosts.base"; echo "$MARK_BEGIN"; echo "# managed by homelab-cache setup; undo with --remove"
     for h in $HOSTS; do printf '%s %s\n' "$IP" "$h"; done; echo "$MARK_END"; } > "$TMP/hosts.full"
   if [ "$DRY" = 1 ]; then
     say "  would write:"; for h in $HOSTS; do say "    $IP $h"; done
   else
-    [ -e "$HOSTS_FILE.docker-registry-cache.bak" ] || cp -p "$HOSTS_FILE" "$HOSTS_FILE.docker-registry-cache.bak" 2>/dev/null || true
+    [ -e "$HOSTS_FILE.homelab-cache.bak" ] || cp -p "$HOSTS_FILE" "$HOSTS_FILE.homelab-cache.bak" 2>/dev/null || true
     cat "$TMP/hosts.full" > "$HOSTS_FILE"
     for h in $HOSTS; do ok "$IP $h"; done
-    say "  (original saved as $HOSTS_FILE.docker-registry-cache.bak)"
+    say "  (original saved as $HOSTS_FILE.homelab-cache.bak)"
     [ "$OS" = Darwin ] && { dscacheutil -flushcache 2>/dev/null || true; killall -HUP mDNSResponder 2>/dev/null || true; }
   fi
 fi
@@ -343,7 +343,7 @@ if [ "$NO_TRUST" = 0 ]; then
       mac)
         if [ "$DRY" = 1 ]; then say "  would add it to the System keychain as a trusted root"
         else
-          copy="$PREFIX/usr/local/share/docker-registry-cache/ca.crt"
+          copy="$PREFIX/usr/local/share/homelab-cache/ca.crt"
           mkdir -p "$(dirname "$copy")"; cp "$CA_FILE" "$copy"; chmod 644 "$copy"; record_path "$copy"
           security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$copy" && ok "added to the System keychain" \
             || die "security add-trusted-cert failed"
