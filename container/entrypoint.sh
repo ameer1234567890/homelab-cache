@@ -181,6 +181,7 @@ done < "$RUN_DIR/registries.list"
 # Setting APT_REPOSITORIES to an empty value turns apt caching off.
 DEFAULT_APT='debian|Debian|https://deb.debian.org
 debian-security|Debian security|https://security.debian.org
+debian-ftp|Debian (ftp.debian.org)|https://ftp.debian.org
 ubuntu|Ubuntu|https://archive.ubuntu.com
 ubuntu-security|Ubuntu security|https://security.ubuntu.com
 ubuntu-ports|Ubuntu ports (arm and others)|https://ports.ubuntu.com

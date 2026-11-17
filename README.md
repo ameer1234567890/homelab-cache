@@ -310,6 +310,7 @@ Unlike registry traffic, apt files are cached by nginx itself, in `data/.apt-cac
 ```
 debian|Debian|https://deb.debian.org
 debian-security|Debian security|https://security.debian.org
+debian-ftp|Debian (ftp.debian.org)|https://ftp.debian.org
 ubuntu|Ubuntu|https://archive.ubuntu.com
 ubuntu-security|Ubuntu security|https://security.ubuntu.com
 ubuntu-ports|Ubuntu ports (arm and others)|https://ports.ubuntu.com
@@ -338,7 +339,7 @@ address=/deb.debian.org/192.168.1.50
 address=/security.debian.org/192.168.1.50
 
 # or /etc/hosts
-192.168.1.50  deb.debian.org security.debian.org archive.ubuntu.com security.ubuntu.com ports.ubuntu.com
+192.168.1.50  deb.debian.org security.debian.org ftp.debian.org archive.ubuntu.com security.ubuntu.com ports.ubuntu.com
 192.168.1.50  download.docker.com pkgs.tailscale.com archive.raspberrypi.com github.armbian.com netcup-02.armbian.com
 ```
 
@@ -381,6 +382,7 @@ The second answer should say `X-Cache-Status: HIT`. If not:
 | `HTTP/1.1 301`, `302`, `307` or `308` with a `Location:` header | The mirror redirects package downloads to another server, and the client then fetches from that server directly, so the cache never sees the file | Use a different mirror name for that repository, one that serves files itself |
 | `X-Upstream-Status: 403`, `404`, `429` or `5xx` | The mirror refused or failed the request | Try the same URL with `curl` on a machine without the cache |
 | `X-Cache-Status: MISS` both times, status `200` | The response was not stored | Look for `[error]` or `[crit]` lines from nginx in `docker compose logs homelab-cache` (for example a full disk or a permission error on `data/.apt-cache`) and report them |
+| Everything above looks fine from one machine, but another machine still downloads from the real mirror | The client also has an IPv6 address for the mirror from real DNS (`/etc/hosts` and `address=` lines usually cover IPv4 only), and apt prefers it | On the client, `getent ahosts <mirror name>` must list only the cache's address. Add an IPv6 record for the cache, or return an empty answer for AAAA queries (dnsmasq: `address=/deb.debian.org/::`) |
 | `HIT` on the second request | It works; packages you installed earlier came from a mirror name that is not in `APT_REPOSITORIES`, or from `https://` before the certificate was trusted | Compare the `URIs:` / `deb` lines in the client's apt sources with the mirror list |
 
 Also check that the machine really installs through the cache: `apt-get install --print-uris -y <package>` prints the URL each package comes from. The host in those URLs must be one of the mirrors in `APT_REPOSITORIES`.
