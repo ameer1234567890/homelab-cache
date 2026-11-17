@@ -1,5 +1,5 @@
 # One image, one container: the Docker registry (pull-through, one process per upstream),
-# nginx (TLS on a single port, routes by hostname) and the web UI.
+# nginx (TLS on a single port, routes by hostname; also caches apt mirrors) and the web UI.
 ARG REGISTRY_BASE_IMAGE=registry:3
 FROM ${REGISTRY_BASE_IMAGE} AS registry
 
@@ -8,17 +8,20 @@ FROM ${REGISTRY_BASE_IMAGE} AS registry
 FROM nginx:1.27-alpine-slim
 RUN apk add --no-cache openssl python3 su-exec ca-certificates \
  && rm -f /etc/nginx/conf.d/default.conf \
- && addgroup -g 10001 cache && adduser -D -H -u 10001 -G cache cache
+ && addgroup -g 10001 cache && adduser -D -H -u 10001 -G cache cache \
+ && sed -i -E 's/^user[[:space:]]+[^;]+;/user cache;/' /etc/nginx/nginx.conf \
+ && grep -q '^user cache;' /etc/nginx/nginx.conf
 
 COPY --from=registry /bin/registry /usr/local/bin/registry
 COPY container/entrypoint.sh container/tls.sh /usr/local/bin/
 COPY container/proxy-common.conf /etc/nginx/proxy-common.conf
+COPY container/apt-common.conf /etc/nginx/apt-common.conf
 COPY clients.conf /etc/registry-cache/clients.conf
 COPY ui/ /app/
 COPY client/setup.sh /app/client-setup.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/tls.sh
 
-EXPOSE 443 8080
+EXPOSE 80 443 8080
 VOLUME ["/data", "/certs"]
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
   CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1

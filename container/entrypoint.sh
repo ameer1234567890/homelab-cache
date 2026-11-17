@@ -6,6 +6,7 @@
 #
 #   CACHE_REGISTRIES --> one registry pull-through process per line (127.0.0.1:5001, 5002, ...)
 #                   --> one nginx server block per line, server_name = the upstream's hostname
+#   APT_REPOSITORIES --> one nginx server block per apt mirror (port 80 and 443), cached by nginx itself
 #   plus the web UI (port 8080). Registries and UI run as the unprivileged "cache" user: it owns /data,
 #   so the UI can delete cached files, but it cannot read the root-only CA key.
 #
@@ -19,9 +20,10 @@ DATA="${DATA_DIR:-/data}"
 CERTS="${CERTS:-/certs}"
 STATE_DIR="${STATE_DIR:-$DATA/.registry-cache}"
 ACCESS_LOG="${ACCESS_LOG:-$STATE_DIR/access.log}"
+APT_LOG="${APT_LOG:-$STATE_DIR/apt-access.log}"
 CACHE_TTL="${CACHE_TTL:-720h}"
 LOG_LEVEL="${LOG_LEVEL:-error}"
-export CERTS STATE_DIR ACCESS_LOG
+export CERTS STATE_DIR ACCESS_LOG APT_LOG
 
 die() { echo "[entrypoint] ERROR: $*" >&2; exit 1; }
 log() { echo "[entrypoint] $*"; }
@@ -32,6 +34,29 @@ yq()   { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }   # YAML single
 if ! printf '%s\n' "${CACHE_MAX_SIZE:-}" | grep -Eiq '^[[:space:]]*(([0-9]*\.?[0-9]+[[:space:]]*(([kmgtp]i?)?b?)?)?)[[:space:]]*$'; then
   die "CACHE_MAX_SIZE='${CACHE_MAX_SIZE}' is not a size. Use something like 50GB, 500MB or 1.5TB, or leave it empty for no limit."
 fi
+
+# apt caching settings. APT_MAX_SIZE takes the same sizes as CACHE_MAX_SIZE; nginx wants whole megabytes.
+APT_DIR="${APT_DIR:-$DATA/.apt-cache}"   # a dot folder, so the UI does not mistake it for a registry
+APT_INDEX_TTL="${APT_INDEX_TTL:-5m}"
+APT_PACKAGE_TTL="${APT_PACKAGE_TTL:-30d}"
+for v in APT_INDEX_TTL APT_PACKAGE_TTL; do
+  eval "val=\${$v}"
+  printf '%s\n' "$val" | grep -Eq '^[0-9]+(ms|s|m|h|d|w|M|y)$' \
+    || die "$v='$val' is not a duration. Use something like 5m, 12h or 30d."
+done
+if ! printf '%s\n' "${APT_MAX_SIZE:-}" | grep -Eiq '^[[:space:]]*(([0-9]*\.?[0-9]+[[:space:]]*(([kmgtp]i?)?b?)?)?)[[:space:]]*$'; then
+  die "APT_MAX_SIZE='${APT_MAX_SIZE}' is not a size. Use something like 50GB, 500MB or 1.5TB, or leave it empty for no limit."
+fi
+# 50GB -> 47684 (whole megabytes, at least 1); empty or 0 -> nothing
+apt_mb="$(printf '%s' "${APT_MAX_SIZE:-}" | awk '{
+  s = tolower($0); gsub(/[[:space:]]/, "", s)
+  if (s == "") exit
+  match(s, /^[0-9]*\.?[0-9]+/); n = substr(s, 1, RLENGTH) + 0; u = substr(s, RLENGTH + 1)
+  power = index("kmgtp", substr(u, 1, 1)); base = (u ~ /i/) ? 1024 : 1000
+  mb = n * base ^ power / 1048576
+  if (mb <= 0) exit
+  printf "%.0f", (mb < 1 ? 1 : mb)
+}')"
 mkdir -p "$RUN_DIR" "$(dirname "$NGINX_CONF")" "$DATA"
 rm -f "$RUN_DIR"/*.yml
 
@@ -149,6 +174,134 @@ done < "$RUN_DIR/registries.list"
 
 [ "$n" -gt 0 ] || die "no registries defined in CACHE_REGISTRIES"
 
+# ---- apt mirrors ---------------------------------------------------------------
+# Same idea as the registries: one line each, "id | display name | upstream URL". Clients keep using the real
+# mirror names (deb.debian.org, ...), DNS sends them here, and nginx picks the mirror by Host header (port 80)
+# or TLS server name (port 443). Unlike registry traffic, apt files are cached by nginx itself.
+# Setting APT_REPOSITORIES to an empty value turns apt caching off.
+DEFAULT_APT='debian|Debian|https://deb.debian.org
+debian-security|Debian security|https://security.debian.org
+ubuntu|Ubuntu|https://archive.ubuntu.com
+ubuntu-security|Ubuntu security|https://security.ubuntu.com
+ubuntu-ports|Ubuntu ports (arm and others)|https://ports.ubuntu.com
+docker|Docker|https://download.docker.com
+tailscale|Tailscale|https://pkgs.tailscale.com
+raspberrypi|Raspberry Pi OS|https://archive.raspberrypi.com
+armbian|Armbian (GitHub)|https://github.armbian.com
+armbian-netcup|Armbian (netcup)|https://netcup-02.armbian.com'
+printf '%s\n' "${APT_REPOSITORIES-$DEFAULT_APT}" > "$RUN_DIR/apt.list"
+
+apt_hosts=""
+ui_apt=""
+apt_n=0
+: > "$RUN_DIR/apt-servers.conf"
+while IFS='|' read -r raw_id raw_name raw_up _rest || [ -n "${raw_id:-}" ]; do
+  id="$(trim "${raw_id:-}")"
+  case "$id" in ''|'#'*) continue ;; esac
+  case "$id" in *[!a-z0-9-]*|-*) die "invalid apt repository id '$id' (lowercase letters, digits and hyphens only)" ;; esac
+  name="$(trim "${raw_name:-}")"; [ -n "$name" ] || name="$id"
+  upstream="$(trim "${raw_up:-}")"
+  [ -n "$upstream" ] || die "apt repository '$id' has no upstream URL in APT_REPOSITORIES"
+  case "$upstream" in http://*|https://*) ;; *) upstream="https://$upstream" ;; esac
+
+  scheme="${upstream%%://*}"
+  rest="${upstream#*://}"; host="${rest%%/*}"; path="${rest#"$host"}"
+  case "$path" in
+    ''|/) ;;
+    *) die "apt repository '$id': '$upstream' has a path. Give only the mirror's hostname; clients keep their own paths such as /debian." ;;
+  esac
+  case "$host" in
+    *:*) die "apt repository '$id': '$host' has a port. Clients reach the cache on 80 and 443, so the name must not include one." ;;
+    ''|*[!a-z0-9.-]*) die "apt repository '$id': '$host' is not a lowercase hostname" ;;
+  esac
+  case " $hosts $apt_hosts " in *" $host "*) die "hostname '$host' is listed twice. Hostnames must be unique across CACHE_REGISTRIES and APT_REPOSITORIES" ;; esac
+  apt_hosts="$apt_hosts $host"
+  apt_n=$((apt_n + 1))
+  ui_apt="${ui_apt}${id}|${name}|${host}
+"
+
+  cat >> "$RUN_DIR/apt-servers.conf" <<CONF
+# apt: ${name}
+server {
+    listen 80;
+    listen 443 ssl;
+    server_name ${host};
+    set \$apt_upstream ${scheme}://${host};
+    access_log ${APT_LOG} apt_json;
+
+    location = /.well-known/registry-cache-probe { return 200 "registry-cache\n"; }
+
+    proxy_ssl_verify on;
+    proxy_ssl_verify_depth 4;
+    proxy_ssl_trusted_certificate ${RUN_DIR}/apt-ca.pem;
+
+    # Package files never change once published, so they are kept long. Everything else is an index
+    # (InRelease, Packages.xz, ...), which changes and is kept only briefly, then re-checked cheaply.
+    location ~* \.(deb|udeb|ddeb|dsc|tar\.[a-z0-9]+|diff\.gz)\$ {
+        proxy_pass \$apt_upstream;
+        include /etc/nginx/apt-common.conf;
+        proxy_cache_valid 200 ${APT_PACKAGE_TTL};
+        proxy_cache_valid 404 1m;
+    }
+    location ~ /by-hash/ {
+        proxy_pass \$apt_upstream;
+        include /etc/nginx/apt-common.conf;
+        proxy_cache_valid 200 ${APT_PACKAGE_TTL};
+        proxy_cache_valid 404 1m;
+    }
+    location / {
+        proxy_pass \$apt_upstream;
+        include /etc/nginx/apt-common.conf;
+        proxy_cache_valid 200 ${APT_INDEX_TTL};
+        proxy_cache_valid 404 1m;
+    }
+}
+
+CONF
+  log "apt mirror '$id': ${host} -> ${scheme}://${host}"
+done < "$RUN_DIR/apt.list"
+
+if [ "$apt_n" -gt 0 ]; then
+  # nginx looks the mirror names up for every request (CDN addresses change), through the container's own resolvers.
+  resolvers=""
+  for ns in $(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null); do
+    case "$ns" in *:*) ns="[$ns]" ;; esac
+    resolvers="$resolvers $ns"
+  done
+  [ -n "$resolvers" ] || resolvers=" 1.1.1.1 8.8.8.8"
+
+  # Roots for verifying the mirrors' TLS: the system's, plus anything in /upstream-ca (same as for registries).
+  { cat /etc/ssl/certs/ca-certificates.crt 2>/dev/null || true
+    find /upstream-ca -type f \( -name '*.crt' -o -name '*.pem' \) -exec sh -c 'for f; do cat "$f"; echo; done' sh {} + 2>/dev/null || true
+  } > "$RUN_DIR/apt-ca.pem"
+
+  apt_max=""; [ -z "$apt_mb" ] || apt_max=" max_size=${apt_mb}m"
+  {
+    echo "# apt mirrors (APT_REPOSITORIES): one shared cache, keyed by mirror name and path."
+    # One short line per apt request: which mirror, whether the cache answered, how many bytes. The web UI reads it for statistics.
+    echo 'log_format apt_json escape=json '"'"'{"t":$msec,"h":"$server_name","m":"$request_method","u":"$uri","s":$status,"b":$body_bytes_sent,"c":"$upstream_cache_status"}'"'"';'
+    echo "proxy_cache_path ${APT_DIR} levels=1:2 keys_zone=apt:50m inactive=90d use_temp_path=off${apt_max};"
+    echo "resolver${resolvers} valid=300s ipv6=off;"
+    echo "resolver_timeout 10s;"
+    echo
+    cat "$RUN_DIR/apt-servers.conf"
+    # Port 80 carries apt traffic, so anything else arriving there (the bare IP, an unknown name) gets the UI.
+    cat <<CONF
+server {
+    listen 80 default_server;
+    server_name _;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 180s;
+    }
+}
+
+CONF
+  } >> "$NGINX_CONF"
+fi
+
 # Any other hostname (including the bare IP) gets the web UI.
 cat >> "$NGINX_CONF" <<CONF
 server {
@@ -177,13 +330,25 @@ mkdir -p "$STATE_DIR"
 touch "$ACCESS_LOG"
 chown cache:cache "$STATE_DIR" "$ACCESS_LOG" 2>/dev/null || true
 chmod 644 "$ACCESS_LOG" 2>/dev/null || true
+if [ "$apt_n" -gt 0 ]; then
+  mkdir -p "$APT_DIR"
+  touch "$APT_LOG"
+  chown cache:cache "$APT_DIR" "$APT_LOG" 2>/dev/null || true
+  chmod 644 "$APT_LOG" 2>/dev/null || true
+fi
 
 # ---- TLS ---------------------------------------------------------------------
 # Use the certificate you provide, or generate one that covers every registry name.
-TLS_HOSTS="${hosts# }" sh /usr/local/bin/tls.sh
+TLS_HOSTS="${hosts# }${apt_hosts}" sh /usr/local/bin/tls.sh
 for h in $hosts; do
   if ! openssl x509 -in /run/tls/server.crt -noout -checkhost "$h" 2>/dev/null | grep -q 'does match'; then
     log "WARNING: the server certificate does not cover $h. Clients will reject TLS for it."
+  fi
+done
+# apt works over plain HTTP, so an uncovered mirror name is only a problem for clients that use https:// sources.
+for h in $apt_hosts; do
+  if ! openssl x509 -in /run/tls/server.crt -noout -checkhost "$h" 2>/dev/null | grep -q 'does match'; then
+    log "note: the server certificate does not cover apt mirror $h. Fine for http:// sources; https:// ones will be rejected."
   fi
 done
 nginx -t >/dev/null 2>&1 || { nginx -t; die "generated nginx configuration is invalid"; }
@@ -191,6 +356,7 @@ nginx -t >/dev/null 2>&1 || { nginx -t; die "generated nginx configuration is in
 # ---- Environment for children --------------------------------------------------
 # Extra roots for upstream TLS (Go merges every PEM in these directories).
 export SSL_CERT_DIR="/upstream-ca:/etc/ssl/certs"
+export APT_MIRRORS="$ui_apt" APT_DIR
 export REGISTRIES="$ui_regs" DATA_DIR="$DATA" PUBLIC_CERT_DIR="${PUBLIC_DIR:-/run/public-certs}"
 [ -z "${HTTPS_PROXY:-}${HTTP_PROXY:-}" ] || log "upstream traffic goes through proxy ${HTTPS_PROXY:-$HTTP_PROXY}"
 
@@ -204,12 +370,16 @@ trap 'stop 0' TERM INT
 for id in $started; do start su-exec cache registry serve "$RUN_DIR/$id.yml"; done
 start nginx -g 'daemon off;'
 start su-exec cache python3 /app/app.py
-log "up: $n registries on :443 ($(echo $hosts)), UI on :8080"
+if [ "$apt_n" -gt 0 ]; then
+  log "up: $n registries on :443 ($(echo $hosts)), $apt_n apt mirrors on :80 and :443 ($(echo $apt_hosts)), UI on :8080"
+else
+  log "up: $n registries on :443 ($(echo $hosts)), UI on :8080"
+fi
 
 # A cache whose upstream names resolve back to itself would loop. Check once, shortly after start.
 (
   sleep 5
-  for h in $hosts; do
+  for h in $hosts $apt_hosts; do
     reply="$(wget -q -T 5 --no-check-certificate -O - "https://$h/.well-known/registry-cache-probe" 2>/dev/null || true)"
     case "$reply" in
       *registry-cache*) echo "[entrypoint] WARNING: inside this container $h resolves to the cache itself, so pulls will loop." \

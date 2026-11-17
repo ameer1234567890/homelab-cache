@@ -9,6 +9,9 @@ name: homelab-cache
 #   docker pull alpine              ─▶ registry-1.docker.io ─┘     (chosen by TLS server name)
 #
 #   any other name / IP ─▶ web UI (also plain http://<host>:8080)
+#
+# The same container also caches apt mirrors (deb.debian.org, archive.ubuntu.com, ...) on port 80 (and 443),
+# the same way: point the mirror names here, keep your sources.list as it is.
 
 services:
   homelab-cache:
@@ -20,7 +23,8 @@ services:
     init: true
     restart: unless-stopped
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:443:443"                  # every registry, TLS
+      - "${BIND_ADDR:-0.0.0.0}:443:443"                  # every registry, TLS (and apt over https)
+      - "${BIND_ADDR:-0.0.0.0}:${APT_HTTP_PORT:-80}:80"  # apt mirrors, plain HTTP. Remove this line if you do not cache apt.
       - "${BIND_ADDR:-0.0.0.0}:${UI_PORT:-8080}:8080"    # web UI, plain HTTP
 
     # IMPORTANT: the cache must resolve ghcr.io, quay.io, ... to their REAL addresses.
@@ -41,6 +45,24 @@ services:
         gcr|Google Container Registry|https://gcr.io
         k8s|Kubernetes registry|https://registry.k8s.io
         mcr|Microsoft Container Registry|https://mcr.microsoft.com
+      # Which apt mirrors to cache: id | display name | upstream hostname, one per line. Clients keep their own
+      # sources.list; DNS sends the mirror names here. Comment every line out to turn apt caching off.
+      # Only the hostname goes in the URL (no path, no port); the upstream is reached over the scheme you give.
+      APT_REPOSITORIES: |
+        debian|Debian|https://deb.debian.org
+        debian-security|Debian security|https://security.debian.org
+        ubuntu|Ubuntu|https://archive.ubuntu.com
+        ubuntu-security|Ubuntu security|https://security.ubuntu.com
+        ubuntu-ports|Ubuntu ports (arm and others)|https://ports.ubuntu.com
+        docker|Docker|https://download.docker.com
+        tailscale|Tailscale|https://pkgs.tailscale.com
+        raspberrypi|Raspberry Pi OS|https://archive.raspberrypi.com
+        armbian|Armbian (GitHub)|https://github.armbian.com
+        armbian-netcup|Armbian (netcup)|https://netcup-02.armbian.com
+      APT_HTTP_PORT: ${APT_HTTP_PORT:-80}        # only so the web UI can show the right URLs; the host port is set in `ports` above
+      APT_INDEX_TTL: ${APT_INDEX_TTL:-5m}        # how long Packages/InRelease files are served without asking the mirror
+      APT_PACKAGE_TTL: ${APT_PACKAGE_TTL:-30d}   # how long .deb files are served without asking the mirror
+      APT_MAX_SIZE: ${APT_MAX_SIZE:-}            # e.g. 20GB; separate from CACHE_MAX_SIZE. Empty = no limit
       CACHE_TTL: ${CACHE_TTL:-720h}
       # Upper limit for the whole cache, e.g. 50GB. Over it, the least recently pulled images are removed first.
       # Empty means no limit.

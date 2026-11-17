@@ -97,6 +97,42 @@
   const hostLabel = (h) => h.name || h.ip;
   const inScope = () => registries().filter((r) => state.reg === 'all' || r.id === state.reg);
 
+  // apt mirrors are listed after the registries; their rail entries use the id `apt:<mirror id>`.
+  const aptMirrors = () => (state.data && state.data.apt && state.data.apt.mirrors) || [];
+  const aptBytes = () => aptMirrors().reduce((s, m) => s + m.disk_bytes, 0);
+  // `apt:*` is the combined "All apt mirrors" view: one mirror-shaped object that adds up all of them.
+  // `*` cannot appear in a mirror id, so it never clashes. Built once per scan, not once per render.
+  let aptAllMemo = { data: null, view: null };
+  function aptAllView() {
+    if (aptAllMemo.data !== state.data) {
+      const ms = aptMirrors();
+      const sum = (k) => ms.reduce((t, m) => t + m[k], 0);
+      aptAllMemo = { data: state.data, view: {
+        id: '*', all: true, name: 'All apt mirrors', host: '', files: sum('files'), disk_bytes: sum('disk_bytes'),
+        pkg_count: sum('pkg_count'), pkg_bytes: sum('pkg_bytes'), other_files: sum('other_files'), other_bytes: sum('other_bytes'),
+        truncated: ms.some((m) => m.truncated), mirrorCount: ms.length,
+        packages: ms.flatMap((m) => m.packages.map((p) => ({ ...p, mirror: m.id, mirrorName: m.name }))),
+      } };
+    }
+    return aptAllMemo.view;
+  }
+  function aptMirror() {
+    if (!state.data || !String(state.reg).startsWith('apt:')) return null;
+    if (state.reg === 'apt:*') return aptMirrors().length > 1 ? aptAllView() : null;
+    return aptMirrors().find((m) => m.id === state.reg.slice(4)) || null;
+  }
+  function aptRows() {
+    const m = aptMirror();
+    if (!m) return [];
+    const q = state.q.trim().toLowerCase();
+    const rows = q ? m.packages.filter((p) => p.name.toLowerCase().includes(q) || p.version.toLowerCase().includes(q)
+      || (p.mirrorName || '').toLowerCase().includes(q)) : [...m.packages];
+    const key = ['name', 'size', 'updated'].includes(state.sort.key) ? state.sort.key : 'size';
+    const val = { name: (p) => p.name.toLowerCase(), size: (p) => p.size, updated: (p) => p.cached }[key];
+    const dir = state.sort.dir === 'asc' ? 1 : -1;
+    return rows.sort((a, b) => ((val(a) < val(b) ? -1 : val(a) > val(b) ? 1 : 0) * dir) || a.name.localeCompare(b.name));
+  }
+
   function allRows() {
     const rows = [];
     registries().forEach((reg, ri) => {
@@ -208,14 +244,17 @@
       el.innerHTML = '<div><p class="lede">Scanning the cache…</p></div>';
       return;
     }
+    const am = aptMirror();
+    if (am) { renderAptHero(am); return; }
     const regs = inScope();
     const total = regs.reduce((s, r) => s + r.disk_bytes, 0);
     const images = regs.reduce((s, r) => s + r.repo_count, 0);
     const tags = regs.reduce((s, r) => s + r.tag_count, 0);
     const p = fmtParts(total);
     const d = state.data.disk;
+    const aptAll = state.reg === 'all' && aptBytes() ? ` Another ${fmtBytes(aptBytes())} is apt packages, listed under apt mirrors.` : '';
     const lede = state.reg === 'all'
-      ? `on disk across ${plural(regs.length, 'registry')}, holding ${plural(images, 'image')} and ${plural(tags, 'tag')}.`
+      ? `on disk across ${plural(regs.length, 'registry')}, holding ${plural(images, 'image')} and ${plural(tags, 'tag')}.${aptAll}`
       : `on disk for ${esc(regs[0] ? regs[0].name : '')}, holding ${plural(images, 'image')} and ${plural(tags, 'tag')}.`;
     const pct = d && d.total ? Math.min(100, (d.used / d.total) * 100) : 0;
     // The size limit applies to the whole cache, whichever registry is selected.
@@ -235,8 +274,31 @@
       </div>` : ''}`;
   }
 
+  function renderAptHero(m) {
+    const el = $('#hero');
+    const p = fmtParts(m.disk_bytes);
+    const d = state.data.disk;
+    const apt = state.data.apt;
+    const pct = d && d.total ? Math.min(100, (d.used / d.total) * 100) : 0;
+    const cap = apt.limit_bytes;
+    const used = aptBytes() + (apt.unlisted_bytes || 0);
+    const limit = cap ? `
+        <div class="meter limit${used > cap ? ' over' : ''}" role="img" aria-label="${Math.round((used / cap) * 100)}% of the apt cache size limit is used"><i style="width:${Math.min(100, (used / cap) * 100)}%"></i></div>
+        <p>${fmtBytes(used)} of the ${fmtBytes(cap)} apt cache limit, shared by all apt mirrors. The least recently used files are removed first.</p>` : '';
+    el.innerHTML = `
+      <div>
+        <div class="figure"><span class="big">${p.v}</span><span class="unit">${p.u}</span></div>
+        <p class="lede">${m.all ? `on disk across ${plural(m.mirrorCount, 'apt mirror')}` : `on disk for ${esc(m.name)} (${esc(m.host)})`}, holding ${plural(m.pkg_count, 'package')} and ${plural(m.other_files, 'index file')}.</p>
+      </div>
+      ${(d || limit) ? `<div class="volume">${limit}${d ? `
+        <div class="meter disk" role="img" aria-label="${pct.toFixed(0)}% of the cache volume is used"><i style="width:${pct}%"></i></div>
+        <p>${fmtBytes(d.free)} free of ${fmtBytes(d.total)} on the cache volume.</p>` : ''}
+      </div>` : ''}`;
+  }
+
   function renderStrip() {
     const el = $('#strip');
+    if (aptMirror()) { el.innerHTML = ''; return; }
     const rows = allRows().filter((r) => r.repo.size > 0).sort((a, b) => b.repo.size - a.repo.size);
     const total = rows.reduce((s, r) => s + r.repo.size, 0);
     if (!total) { el.innerHTML = ''; return; }
@@ -261,6 +323,8 @@
     const el = $('#rail');
     const regs = registries();
     const total = regs.reduce((s, r) => s + r.disk_bytes, 0) || 1;
+    const apt = aptMirrors();
+    const aptTotal = aptBytes() || 1;
     const item = (id, name, meta, size, share, color, extra = '') => `
       <button class="reg ${extra}" type="button" data-reg="${esc(id)}" style="--c:${color}"
         aria-pressed="${state.reg === id}">
@@ -272,17 +336,33 @@
       `${plural(regs.reduce((s, r) => s + r.repo_count, 0), 'image')}`, regs.reduce((s, r) => s + r.disk_bytes, 0), 1, 'var(--ink)', 'all')
       + regs.map((r, i) => item(r.id, r.name,
         `${esc(r.upstream || 'unknown upstream')}, ${plural(r.repo_count, 'image')}`,
-        r.disk_bytes, r.disk_bytes / total, colorOf(i))).join('');
+        r.disk_bytes, r.disk_bytes / total, colorOf(i))).join('')
+      + (apt.length ? `<div class="rail-label">apt mirrors</div>`
+        + (apt.length > 1 ? item('apt:*', 'All apt mirrors', `${plural(apt.length, 'mirror')}, ${plural(apt.reduce((t, m) => t + m.pkg_count, 0), 'package')}`,
+          aptBytes(), 1, 'var(--ink)', 'all') : '')
+        + apt.map((m, i) => item(`apt:${m.id}`, m.name,
+        `${esc(m.host)}, ${plural(m.pkg_count, 'package')}`, m.disk_bytes, m.disk_bytes / aptTotal, colorOf(regs.length + i))).join('') : '');
   }
 
   /* ---- hit and miss statistics: [hits, misses, bytes from cache, bytes from upstream, failed requests] */
   const ZERO = () => [0, 0, 0, 0, 0];
   const addArr = (a, b) => a.map((v, i) => v + (b[i] || 0));
 
-  function statsData() {
-    const st = state.data && state.data.stats;
+  function statsSource() {
+    const am = aptMirror();
+    if (am) {
+      const a = state.data.apt;
+      return { apt: true, st: a.stats, enabled: !!(a.tracking && a.tracking.enabled),
+        ids: am.all ? aptMirrors().map((m) => m.id) : [am.id], name: am.all ? 'all apt mirrors' : am.name };
+    }
+    const reg = registries().find((r) => r.id === state.reg);
+    return { apt: false, st: state.data && state.data.stats, enabled: tracking().enabled, id: state.reg, name: reg ? reg.name : state.reg };
+  }
+
+  function statsData(src) {
+    const st = src.st;
     if (!st) return null;
-    const ids = state.reg === 'all'
+    const ids = src.apt ? src.ids : state.reg === 'all'
       ? [...new Set([...Object.keys(st.days), ...Object.keys(st.totals)])]
       : [state.reg];
     const dates = [];
@@ -298,21 +378,39 @@
 
   function renderStats() {
     const el = $('#stats');
-    const d = state.data && tracking().enabled ? statsData() : null;
+    const src = statsSource();
+    const d = state.data && src.enabled ? statsData(src) : null;
     if (!d) { el.hidden = true; return; }
+    const L = src.apt ? {
+      noun: 'file',
+      empty: 'No apt downloads have been recorded',
+      emptyHint: 'Run apt-get update on a client that uses this cache and the savings appear here.',
+      saved: 'of bandwidth saved: files served from the cache that clients would otherwise have downloaded from the mirror again.',
+      upstream: 'mirror', Upstream: 'the mirror',
+      fail: 'mirror errors such as timeouts or a mirror that is down',
+      note: 'A request counts as a hit when the cache answered it, including index files that were re-checked with the mirror and found unchanged. Requests for files that do not exist are not counted.',
+    } : {
+      noun: 'layer',
+      empty: 'No layer downloads have been recorded',
+      emptyHint: 'Pull an image through the cache and the savings appear here.',
+      saved: 'of bandwidth saved: layers served from the cache that clients would otherwise have downloaded from the upstream registry again.',
+      upstream: 'upstream', Upstream: 'upstream',
+      fail: 'for example rate limits; see the image details',
+      note: 'A layer counts as a hit when it was already in the cache when the client asked for it. The registry does not report this, so it is worked out from the request log and file times and is a close estimate that leans towards counting misses.',
+    };
     el.hidden = false;
     const [hitN, missN, hitB, missB, failN] = d.window;
     const served = hitB + missB;
     const requests = hitN + missN;
-    const scope = state.reg === 'all' ? '' : ` for ${esc((registries().find((r) => r.id === state.reg) || {}).name || state.reg)}`;
+    const scope = !src.apt && state.reg === 'all' ? '' : ` for ${esc(src.name)}`;
     const range = Object.entries(RANGES).map(([k, r]) =>
       `<button type="button" data-range="${k}" aria-pressed="${state.range === k}">${r.label}</button>`).join('');
     const head = `<div class="stats-head"><h2>Cache performance${scope}</h2>
       <div class="range" role="group" aria-label="Time range">${range}</div></div>`;
 
     if (!requests && !failN) {
-      el.innerHTML = `${head}<p class="stats-empty">No layer downloads have been recorded${state.range === 'all' ? ' yet' : ' in this period'}.
-        Pull an image through the cache and the savings appear here.</p>`;
+      el.innerHTML = `${head}<p class="stats-empty">${L.empty}${state.range === 'all' ? ' yet' : ' in this period'}.
+        ${L.emptyHint}</p>`;
       return;
     }
 
@@ -321,8 +419,8 @@
     const byCount = requests ? Math.round((hitN / requests) * 100) : 0;
     const peak = Math.max(...d.perDay.map((a) => a[2] + a[3]), 1);
     const bars = d.perDay.map((a, i) => {
-      const tip = `${dayLabel(d.dates[i])}: ${fmtBytes(a[2])} from the cache, ${fmtBytes(a[3])} from upstream`
-        + (a[0] + a[1] ? ` (${Math.round((a[0] / (a[0] + a[1])) * 100)}% of layers from the cache)` : '');
+      const tip = `${dayLabel(d.dates[i])}: ${fmtBytes(a[2])} from the cache, ${fmtBytes(a[3])} from ${L.Upstream}`
+        + (a[0] + a[1] ? ` (${Math.round((a[0] / (a[0] + a[1])) * 100)}% of ${L.noun}s from the cache)` : '');
       return `<div class="day" title="${esc(tip)}" role="img" aria-label="${esc(tip)}">
         <i class="b-miss" style="height:${(a[3] / peak) * 100}%"></i><i class="b-hit" style="height:${(a[2] / peak) * 100}%"></i></div>`;
     }).join('');
@@ -333,33 +431,45 @@
       <div class="stats-body">
         <div class="stats-figs">
           <div class="figure"><span class="big sm">${p.v}</span><span class="unit">${p.u}</span></div>
-          <p class="lede">of bandwidth saved: layers served from the cache that clients would otherwise have downloaded from the upstream registry again.</p>
+          <p class="lede">${L.saved}</p>
           <dl class="kv">
-            <div><dt>Hit rate</dt><dd>${byData}% of data</dd><dd class="sub">${byCount}% of layers (${hitN.toLocaleString()} of ${requests.toLocaleString()})</dd></div>
+            <div><dt>Hit rate</dt><dd>${byData}% of data</dd><dd class="sub">${byCount}% of ${L.noun}s (${hitN.toLocaleString()} of ${requests.toLocaleString()})</dd></div>
             <div><dt>Served from the cache</dt><dd>${fmtBytes(hitB)}</dd></div>
-            <div><dt>Fetched from upstream</dt><dd>${fmtBytes(missB)}</dd><dd class="sub">${plural(missN, 'layer')} that were not cached yet</dd></div>
-            ${failN ? `<div class="bad"><dt>Failed requests</dt><dd>${failN.toLocaleString()}</dd><dd class="sub">for example rate limits; see the image details</dd></div>` : ''}
+            <div><dt>Fetched from ${L.Upstream}</dt><dd>${fmtBytes(missB)}</dd><dd class="sub">${plural(missN, L.noun)} that were not cached yet</dd></div>
+            ${failN ? `<div class="bad"><dt>Failed requests</dt><dd>${failN.toLocaleString()}</dd><dd class="sub">${L.fail}</dd></div>` : ''}
           </dl>
         </div>
         <div class="stats-chart">
-          <div class="legend"><span><i class="b-hit"></i>From the cache</span><span><i class="b-miss"></i>From upstream</span>
+          <div class="legend"><span><i class="b-hit"></i>From the cache</span><span><i class="b-miss"></i>From ${L.Upstream}</span>
             <span class="muted">${state.range === 'all' ? 'Daily, last 30 days' : 'Daily'}</span></div>
           <div class="bars" style="--n:${d.dates.length}">${bars}</div>
           <div class="axis"><span>${first}</span><span>busiest day ${fmtBytes(peak)}</span><span>${last}</span></div>
         </div>
       </div>
-      <p class="note">A layer counts as a hit when it was already in the cache when the client asked for it. The registry does not report this,
-      so it is worked out from the request log and file times and is a close estimate that leans towards counting misses.${d.since ? ` Counting started ${esc(absDate(d.since))}.` : ''}
-      Statistics are kept when images are deleted.</p>`;
+      <p class="note">${L.note}${d.since ? ` Counting started ${esc(absDate(d.since))}.` : ''}
+      Statistics are kept when ${src.apt ? 'files' : 'images'} are deleted.</p>`;
   }
 
   function renderBulk() {
     const btn = $('#bulk');
+    const aptBtn = $('#bulk-apt');
+    const am = aptMirror();
+    const aptAnything = aptMirrors().some((m) => m.files > 0) || !!(state.data && state.data.apt && state.data.apt.unlisted_bytes);
+    // The whole-cache buttons: docker on the registry overview, apt on the overview and on any apt mirror
+    // (when there is more than one mirror, so it differs from the mirror's own button).
+    aptBtn.textContent = 'Delete entire apt cache…';
+    aptBtn.hidden = !canDelete() || !state.data || !aptAnything || !(state.reg === 'all' || (am && !am.all && aptMirrors().length > 1));
+    if (am) {
+      // On "All apt mirrors" the main button is the whole-apt-cache one, so the second button is not needed.
+      btn.hidden = !canDelete() || !(am.all ? aptAnything : am.files);
+      btn.textContent = am.all ? 'Delete entire apt cache…' : `Delete all in ${am.name}…`;
+      return;
+    }
     const regs = inScope();
     const anything = regs.some((r) => r.repo_count > 0 || r.disk_bytes > 0);
     btn.hidden = !canDelete() || !state.data || !anything;
     if (btn.hidden) return;
-    btn.textContent = state.reg === 'all' ? 'Delete entire cache…' : `Delete all in ${regs[0].name}…`;
+    btn.textContent = state.reg === 'all' ? 'Delete entire docker cache…' : `Delete all in ${regs[0].name}…`;
   }
 
   function th(key, label, cls = '') {
@@ -427,6 +537,46 @@
     }).join('');
   }
 
+  function renderAptTable(el, m) {
+    const rows = aptRows();
+    $('#count').textContent = m.pkg_count ? `${plural(rows.length, 'package')} shown` : '';
+    if (!m.files) {
+      el.innerHTML = `<div class="empty"><h2>Nothing cached yet</h2>
+        <p>Run <code>apt-get update</code> and install a package on a client that uses this cache, and it will appear here after the next scan.</p>
+        <button class="btn primary" type="button" data-action="connect">See how to connect a client</button></div>`;
+      return;
+    }
+    const notes = [];
+    if (m.other_files) {
+      notes.push(`Plus ${plural(m.other_files, 'index file')} (${fmtBytes(m.other_bytes)}): the package lists apt reads before it installs anything. They are refreshed on their own, so they are not listed.`);
+    }
+    if (m.truncated) {
+      notes.push(`Showing the newest ${m.packages.length.toLocaleString()} of ${m.pkg_count.toLocaleString()} cached packages${m.all ? ' (at most 2,000 per mirror)' : ''}. Use the filter to find others.`);
+    }
+    const noteHtml = notes.length ? `<p class="note">${notes.join(' ')}</p>` : '';
+    if (!rows.length) {
+      el.innerHTML = `<div class="empty"><h2>${m.pkg_count ? 'No matches' : 'No packages cached yet'}</h2>
+        <p>${m.pkg_count ? `No package matches “${esc(state.q)}”.` : 'Only index files are cached so far. Install a package on a client and it appears here.'}</p></div>${noteHtml}`;
+      return;
+    }
+    const max = Math.max(...rows.map((p) => p.size), 1);
+    const colorFor = (id) => colorOf(registries().length + Math.max(0, aptMirrors().findIndex((x) => x.id === id)));
+    const body = rows.map((p) => {
+      const mid = p.mirror || m.id;
+      const color = colorFor(mid);
+      return `<tr class="row">
+        <td><span class="twirl static"><span class="dot" style="--c:${color}"></span><span class="repo">${esc(p.name)}</span></span></td>
+        <td><code>${esc(p.version)}</code></td>
+        ${m.all ? `<td class="hide-md">${esc(p.mirrorName)}</td>` : ''}
+        <td class="hide-sm">${chips([p.arch])}</td>
+        <td class="num"><span class="sizecell"><span class="bar" style="--c:${color}"><i style="width:${(p.size / max) * 100}%"></i></span>${fmtBytes(p.size)}</span></td>
+        <td class="num" title="${esc(absTime(p.cached))}">${ago(p.cached)}</td>
+        <td class="act">${deleteButton('apt_file', mid, p.file, '', `Delete ${p.name} ${p.version} from the cache`)}</td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = `<table><thead><tr>${th('name', 'Package')}<th>Version</th>${m.all ? '<th class="hide-md">Mirror</th>' : ''}<th class="hide-sm">Architecture</th>${th('size', 'Size', 'num')}${th('updated', 'Cached', 'num')}<th class="act"></th></tr></thead><tbody>${body}</tbody></table>${noteHtml}`;
+  }
+
   function renderTable() {
     const el = $('#table');
     if (!state.data) {
@@ -434,6 +584,8 @@
       $('#count').textContent = '';
       return;
     }
+    const am = aptMirror();
+    if (am) { renderAptTable(el, am); return; }
     const rows = filteredRows();
     const everything = allRows();
     $('#count').textContent = everything.length ? `${plural(rows.length, 'image')} shown` : '';
@@ -486,8 +638,10 @@
     if (!state.data || !state.data.scanned_at) { el.textContent = ''; return; }
     const d = state.data;
     el.innerHTML = `Scanned ${ago(d.scanned_at)} in ${d.scan_seconds} s${d.scanning ? ' (rescanning now)' : ''}. `
-      + 'Sizes are the compressed bytes stored on disk; layers shared between images are counted once per image and once on disk. '
-      + cleanupNote(d)
+      + (aptMirror()
+        ? 'Sizes are the bytes stored on disk. Cached is when the cache stored the file. Package files are kept for a long time and checked with the mirror again when they expire; unused files are removed after 90 days. '
+        : 'Sizes are the compressed bytes stored on disk; layers shared between images are counted once per image and once on disk. '
+          + cleanupNote(d))
       + (d.ca_available ? '<a href="/ca.crt">Download the root certificate</a>.' : '');
   }
 
@@ -499,6 +653,9 @@
   }
 
   function render() {
+    const q = $('#q');
+    const label = aptMirror() ? 'Filter by package name' : 'Filter by image or tag';
+    if (q.placeholder !== label) { q.placeholder = label; q.setAttribute('aria-label', label); }
     renderBanner();
     renderHero();
     renderStrip();
@@ -524,7 +681,7 @@
       state.error = err.message || String(err);
     }
     if (force) { btn.disabled = false; btn.textContent = 'Rescan'; }
-    if (state.reg !== 'all' && !registries().some((r) => r.id === state.reg)) state.reg = 'all';
+    if (state.reg !== 'all' && !registries().some((r) => r.id === state.reg) && !aptMirror()) state.reg = 'all';
     render();
   }
 
@@ -597,6 +754,38 @@
          <code>/etc/hosts</code> entries; clients must already trust whatever issued the certificate.</p>
          ${codeBlock(`${curl} ${location.origin}/setup.sh | sudo sh -s -- --no-trust`)}`;
 
+    // apt mirrors (Debian, Ubuntu, ...): cached by nginx on port 80, so no certificate is needed for http:// sources.
+    const apt = (d.apt && d.apt.mirrors) || [];
+    const aptPort = (d.apt && d.apt.port) || 80;
+    let aptHtml = '';
+    if (apt.length) {
+      const aptHosts = apt.map((m) => m.host);
+      const first = aptHosts[0];
+      const probePath = /ubuntu/.test(first) ? '/ubuntu/dists/noble/InRelease'
+        : /debian/.test(first) ? '/debian/dists/stable/InRelease' : '/';
+      const probe = `curl -sI http://${first}${aptPort === 80 ? '' : ':' + aptPort}${probePath} | grep -i x-cache-status`;
+      const portNote = aptPort === 80 ? ''
+        : `<p class="note warn-note">The cache serves apt on port ${aptPort}, not 80. Put it in the mirror URLs in
+           <code>sources.list</code>, for example <code>http://${esc(first)}:${aptPort}/debian</code>. The name itself still points at this server.</p>`;
+      aptHtml = `
+        <h3>Caching apt packages (Debian, Ubuntu)</h3>
+        <p>This cache also keeps the packages and package lists that <code>apt</code> downloads from these mirrors.
+        Keep your <code>sources.list</code> as it is and point the mirror names at this server, the same way as for the registries:</p>
+        <ul>${apt.map((m) => `<li>${esc(m.name)}: <code>${esc(m.host)}</code></li>`).join('')}</ul>
+        <p>On your DNS server (dnsmasq syntax shown), or in <code>/etc/hosts</code> on each client:</p>
+        ${codeBlock(aptHosts.map((x) => `address=/${x}/${ip}`).join('\n'))}
+        ${codeBlock(`${ip} ${aptHosts.join(' ')}`)}
+        <p>If you used the quick setup script above, add this line <em>outside</em> the block the script manages, because the script rewrites its own block.</p>
+        ${portNote}
+        <p>Then use apt as usual. <code>http://</code> sources need no certificate. Sources that use <code>https://</code>
+        need the root certificate from step 2 trusted on the client.</p>
+        ${codeBlock('sudo apt-get update && sudo apt-get install -y htop')}
+        <p>To check that it is working, ask for a small file twice: the first answer is <code>MISS</code>, the second <code>HIT</code>.</p>
+        ${codeBlock(probe)}
+        <p class="note">Does your machine use a different mirror name, such as <code>us.archive.ubuntu.com</code>? Add it to
+        <code>APT_REPOSITORIES</code> in <code>docker-compose.yml</code> and restart, or it will not be cached.</p>`;
+    }
+
     showDialog('#dlg', 'dlg-title', 'Connect a client', `
       <p>Nothing changes in image names or commands. The registries' own hostnames are pointed at this server,
       and the cache is chosen by the name the client asks for.</p>
@@ -612,7 +801,8 @@
       ${codeBlock(`${ip} ${hosts.join(' ')}`)}
       <h4>2. Trust the certificate</h4>${trust}
       <h4>3. Pull as usual</h4>
-      ${codeBlock(examples || '# No registries are configured.')}`);
+      ${codeBlock(examples || '# No registries are configured.')}
+      ${aptHtml}`);
   }
 
   /* ---- who pulled it */
@@ -673,6 +863,34 @@
 
   /* ---- delete */
   function describeDelete(op) {
+    if (op.scope === 'apt_all') {
+      const ms = aptMirrors();
+      const unlisted = (state.data.apt && state.data.apt.unlisted_bytes) || 0;
+      return { title: 'Delete the entire apt cache?', bulk: true,
+        warn: 'Clients download these files from the mirrors again the next time they need them. Downloads running right now may fail and need a retry.',
+        what: 'the entire apt cache, for every mirror',
+        lead: 'This removes <b>every package and index file</b> from <b>every apt mirror</b>.',
+        facts: [`<b>${plural(ms.reduce((s, m) => s + m.pkg_count, 0), 'package')}</b> and <b>${plural(ms.reduce((s, m) => s + m.other_files, 0), 'index file')}</b> across <b>${plural(ms.length, 'mirror')}</b>, <b>${fmtBytes(aptBytes() + unlisted)}</b> freed.`,
+          unlisted ? `This includes ${fmtBytes(unlisted)} cached for mirrors that are no longer in <code>APT_REPOSITORIES</code>.` : 'The mirror list and your settings are kept.',
+          'Docker images are not touched.'] };
+    }
+    if (op.scope === 'apt_file' || op.scope === 'apt_mirror') {
+      const m = aptMirrors().find((x) => x.id === op.mirror);
+      const mname = m ? m.name : op.mirror;
+      const warn = 'Clients download these files from the mirror again the next time they need them. Downloads running right now may fail and need a retry.';
+      if (op.scope === 'apt_file') {
+        const p = m && m.packages.find((x) => x.file === op.file);
+        const label = p ? `${p.name} ${p.version}` : 'this package';
+        return { title: `Delete ${esc(p ? p.name : 'this package')}?`, bulk: false, warn,
+          lead: `This removes the cached copy of <b>${esc(label)}</b> (${esc(mname)}).`,
+          facts: [`<b>${fmtBytes(p ? p.size : 0)}</b> is freed.`, 'Other packages are not touched.'] };
+      }
+      return { title: `Delete everything cached for ${esc(mname)}?`, bulk: true, warn,
+        what: `every package and index file cached for ${esc(mname)}`,
+        lead: `This removes <b>every package and index file</b> cached for <b>${esc(mname)}</b>.`,
+        facts: [`<b>${plural(m ? m.pkg_count : 0, 'package')}</b> and <b>${plural(m ? m.other_files : 0, 'index file')}</b>, <b>${fmtBytes(m ? m.disk_bytes : 0)}</b> freed.`,
+          'Other mirrors and the registries are not touched.'] };
+    }
     const regs = registries();
     const reg = regs.find((r) => r.id === op.registry);
     const note = 'Layers that other cached images also use are kept.';
@@ -698,10 +916,10 @@
     const imgs = regs.reduce((s, r) => s + r.repo_count, 0);
     const tags = regs.reduce((s, r) => s + r.tag_count, 0);
     const bytes = regs.reduce((s, r) => s + r.disk_bytes, 0);
-    return { title: 'Delete the entire cache?', bulk: true, what: 'the entire cache, for every registry',
-      lead: 'This removes <b>everything</b> from <b>every registry</b>.',
+    return { title: 'Delete the entire docker cache?', bulk: true, what: 'the entire docker cache, for every registry',
+      lead: 'This removes <b>every image</b> from <b>every registry</b>.',
       facts: [`<b>${plural(imgs, 'image')}</b> and <b>${plural(tags, 'tag')}</b> across <b>${plural(regs.length, 'registry')}</b>, <b>${fmtBytes(bytes)}</b> freed.`,
-        'The registry list and your settings are kept.'] };
+        'The registry list and your settings are kept.', 'The apt cache is not touched.'] };
   }
 
   function openConfirm(op) {
@@ -715,8 +933,8 @@
       <div class="dlg-body">
         <p class="lead">${d.lead}</p>
         <ul class="facts">${d.facts.map((f) => `<li>${f}</li>`).join('')}</ul>
-        <div class="warnbox"><b>This cannot be undone.</b> Clients will fetch these images from the upstream registry again the next
-        time they pull, which counts against its rate limits. Pulls running right now may fail and need a retry.</div>
+        <div class="warnbox"><b>This cannot be undone.</b> ${d.warn || `Clients will fetch these images from the upstream registry again the next
+        time they pull, which counts against its rate limits. Pulls running right now may fail and need a retry.`}</div>
         ${d.bulk ? `<label class="check"><input type="checkbox" id="understand"><span>I understand that this deletes ${d.what}.</span></label>` : ''}
         ${needsToken ? `<label class="field">Admin token<input type="password" id="token" autocomplete="off" value="${esc(saved)}"></label>` : ''}
         <p class="error" id="del-error" role="alert" hidden></p>
@@ -756,8 +974,10 @@
       dlg.close();
       render();
       const freed = fmtBytes(body.result.freed_bytes);
-      const what = op.scope === 'tag' ? `${op.repo}:${op.tag}` : op.scope === 'repo' ? op.repo
-        : op.scope === 'registry' ? 'that registry' : 'the entire cache';
+      const what = op.scope === 'apt_file' ? 'the package' : op.scope === 'apt_mirror' ? 'that mirror'
+        : op.scope === 'apt_all' ? 'the entire apt cache'
+          : op.scope === 'tag' ? `${op.repo}:${op.tag}` : op.scope === 'repo' ? op.repo
+            : op.scope === 'registry' ? 'that registry' : 'the entire docker cache';
       toast(`Deleted ${what}, freed ${freed}`);
     } catch (e) {
       err.textContent = e.message || String(e);
@@ -804,7 +1024,10 @@
     } else if (t.dataset.hosts) openHosts(t.dataset.hosts);
     else if (t.dataset.gaps) openGaps(t.dataset.gaps);
     else if (t.dataset.delScope) {
-      openConfirm({ scope: t.dataset.delScope, registry: t.dataset.delReg, repo: t.dataset.delRepo || undefined, tag: t.dataset.delTag || undefined });
+      const sc = t.dataset.delScope;
+      openConfirm(sc.startsWith('apt_')
+        ? { scope: sc, mirror: t.dataset.delReg, file: t.dataset.delRepo || undefined }
+        : { scope: sc, registry: t.dataset.delReg, repo: t.dataset.delRepo || undefined, tag: t.dataset.delTag || undefined });
     } else if (t.dataset.action === 'connect') openConnect();
     else if (t.dataset.action === 'close') t.closest('dialog').close();
   });
@@ -828,8 +1051,11 @@
   $('#q').addEventListener('input', (e) => { state.q = e.target.value; renderTable(); });
   $('#refresh').addEventListener('click', () => load(true));
   $('#connect').addEventListener('click', openConnect);
+  $('#bulk-apt').addEventListener('click', () => openConfirm({ scope: 'apt_all' }));
   $('#bulk').addEventListener('click', () => {
-    if (state.reg === 'all') openConfirm({ scope: 'all' });
+    const am = aptMirror();
+    if (am) openConfirm(am.all ? { scope: 'apt_all' } : { scope: 'apt_mirror', mirror: am.id });
+    else if (state.reg === 'all') openConfirm({ scope: 'all' });
     else openConfirm({ scope: 'registry', registry: state.reg });
   });
   $('#theme').addEventListener('click', () => applyTheme(root.dataset.theme === 'dark' ? 'light' : 'dark', true));

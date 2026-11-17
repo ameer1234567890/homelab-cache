@@ -16,13 +16,14 @@ import hmac
 import json
 import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import ssl
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PUBLIC_CERT_DIR = os.environ.get("PUBLIC_CERT_DIR", "/run/public-certs")
@@ -79,6 +80,25 @@ def parse_registries():
     except OSError:
         pass
     return regs
+
+
+def parse_apt_mirrors():
+    """APT_MIRRORS = lines of `id|name|hostname` (set by entrypoint.sh); empty when apt caching is off."""
+    mirrors = []
+    for line in os.environ.get("APT_MIRRORS", "").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 3 and parts[0] and HOSTNAME_RE.match(parts[2]):
+            mirrors.append({"id": parts[0], "name": parts[1] or parts[0], "host": parts[2]})
+    return mirrors
+
+
+def apt_http_port():
+    """The host port clients use for apt (80 unless APT_HTTP_PORT says otherwise)."""
+    try:
+        port = int(os.environ.get("APT_HTTP_PORT", "80"))
+    except ValueError:
+        return 80
+    return port if 0 < port < 65536 else 80
 
 
 def load_client_names():
@@ -807,8 +827,248 @@ def scan_all():
         disk = {"total": usage.total, "used": usage.used, "free": usage.free}
     except OSError:
         pass
+    apt_scan, apt_unlisted = scan_apt(parse_apt_mirrors())
     return {"registries": regs, "disk": disk, "scanned_at": time.time(),
+            "apt_scan": apt_scan, "apt_unlisted_bytes": apt_unlisted,
             "scan_seconds": round(time.time() - started, 2)}
+
+
+# --------------------------------------------------------------------------- apt cache
+# nginx caches the apt mirrors itself (see APT_REPOSITORIES). Each cached file starts with a small header that
+# holds the request it answers ("KEY: <mirror><path>"); the file's name is the md5 of that key. So the cache can
+# be listed without any database: read the key of every file once and remember it.
+APT_DIR = os.environ.get("APT_DIR", os.path.join(DATA_DIR, ".apt-cache"))
+APT_LOG = os.environ.get("APT_LOG", os.path.join(STATE_DIR, "apt-access.log"))
+APT_FILE_RE = re.compile(r"^[0-9a-f]{32}$")
+APT_PKG_RE = re.compile(r"^([^_]+)_([^_]+)_([^_.]+)\.(?:deb|udeb|ddeb)$")
+APT_MAX_PACKAGES = 2000          # per mirror; the newest are listed and the rest are only counted
+_apt_keys = {}                   # file name -> (mirror, path). A name never changes meaning, so this is read once.
+
+
+def apt_limit_bytes():
+    try:
+        return parse_size(os.environ.get("APT_MAX_SIZE", ""))
+    except ValueError:
+        return 0
+
+
+def apt_cache_files():
+    """(file name, full path) for every file in nginx's apt cache (two levels of folders: levels=1:2)."""
+    try:
+        firsts = os.listdir(APT_DIR)
+    except OSError:
+        return
+    for a in firsts:
+        try:
+            seconds = os.listdir(os.path.join(APT_DIR, a))
+        except OSError:
+            continue
+        for b in seconds:
+            folder = os.path.join(APT_DIR, a, b)
+            try:
+                names = os.listdir(folder)
+            except OSError:
+                continue
+            for name in names:
+                if APT_FILE_RE.match(name):
+                    yield name, os.path.join(folder, name)
+
+
+def apt_key(name, path):
+    """(mirror hostname, path) a cache file answers, or None if it cannot be read (yet)."""
+    known = _apt_keys.get(name)
+    if known:
+        return known
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(2048)
+    except OSError:
+        return None
+    start = head.find(b"\nKEY: ")
+    end = head.find(b"\n", start + 6) if start >= 0 else -1
+    if end < 0:
+        return None
+    host, _, rest = head[start + 6:end].decode("utf-8", "replace").partition("/")
+    key = (host.lower(), "/" + rest.split("?", 1)[0])
+    if len(_apt_keys) > 500000:
+        _apt_keys.clear()
+    _apt_keys[name] = key
+    return key
+
+
+def scan_apt(mirrors):
+    """Per mirror id: sizes, counts and the list of cached packages. Also the bytes of unlisted mirrors."""
+    by_host = {m["host"]: m["id"] for m in mirrors}
+    out = {m["id"]: {"files": 0, "disk_bytes": 0, "pkg_count": 0, "pkg_bytes": 0,
+                     "other_files": 0, "other_bytes": 0, "packages": []} for m in mirrors}
+    unlisted = 0
+    for name, path in apt_cache_files():
+        try:
+            size = os.stat(path)
+        except OSError:
+            continue
+        key = apt_key(name, path)
+        mid = by_host.get(key[0]) if key else None
+        if mid is None:
+            unlisted += size.st_size
+            continue
+        rec = out[mid]
+        rec["files"] += 1
+        rec["disk_bytes"] += size.st_size
+        pkg = APT_PKG_RE.match(unquote(posixpath.basename(key[1])))
+        if pkg:
+            rec["pkg_count"] += 1
+            rec["pkg_bytes"] += size.st_size
+            rec["packages"].append({"file": name, "name": pkg.group(1), "version": pkg.group(2),
+                                    "arch": pkg.group(3), "size": size.st_size, "cached": size.st_ctime})
+        else:
+            rec["other_files"] += 1
+            rec["other_bytes"] += size.st_size
+    for rec in out.values():
+        rec["packages"].sort(key=lambda p: p["cached"], reverse=True)
+        rec["truncated"] = rec["pkg_count"] > APT_MAX_PACKAGES
+        del rec["packages"][APT_MAX_PACKAGES:]
+    return out, unlisted
+
+
+def apt_delete_all():
+    """Remove every file in the apt cache, including files of mirrors that are no longer listed."""
+    files = freed = 0
+    for name, path in list(apt_cache_files()):
+        try:
+            size = os.stat(path).st_size
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        files += 1
+        freed += size
+    _apt_keys.clear()
+    return {"files": files, "freed_bytes": freed}
+
+
+def apt_delete(host, only=None):
+    """Remove one cached file (`only`, a file name) or everything cached for a mirror."""
+    items = [(only, os.path.join(APT_DIR, only[-1], only[-3:-1], only))] if only else list(apt_cache_files())
+    files = freed = 0
+    for name, path in items:
+        key = apt_key(name, path)
+        if not key or key[0] != host:
+            continue
+        try:
+            size = os.stat(path).st_size
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        files += 1
+        freed += size
+        _apt_keys.pop(name, None)
+    if only and not files:
+        raise NotFound("That file is no longer in the apt cache.")
+    return {"files": files, "freed_bytes": freed}
+
+
+class AptStats:
+    """Hits and misses per mirror per day, from the apt request log. Same shape as the registry statistics:
+    [requests from the cache, requests from the mirror, bytes from the cache, bytes from the mirror, failures]."""
+
+    HIT = ("HIT", "STALE", "UPDATING", "REVALIDATED")
+    KEEP_DAYS = 90
+
+    def __init__(self, state_dir, log_path, host_to_id):
+        self.log_path, self.host_to_id = log_path, host_to_id
+        self.path = os.path.join(state_dir, "apt-stats.json")
+        self.lock = threading.Lock()
+        self.dirty, self.last_save = False, 0.0
+        self.state = {"v": 1, "since": time.time(), "offset": 0, "inode": 0, "days": {}, "totals": {}}
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict) and loaded.get("v") == 1:
+                self.state.update(loaded)
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def enabled(self):
+        return os.path.exists(self.log_path)
+
+    def poll(self):
+        try:
+            st = os.stat(self.log_path)
+        except OSError:
+            return
+        with self.lock:
+            s = self.state
+            if st.st_ino != s["inode"] or st.st_size < s["offset"]:
+                s["offset"], s["inode"] = 0, st.st_ino
+            while s["offset"] < st.st_size:
+                with open(self.log_path, "rb") as fh:
+                    fh.seek(s["offset"])
+                    data = fh.read(min(st.st_size - s["offset"], 8 * 1024 * 1024))
+                end = data.rfind(b"\n")
+                if end < 0:
+                    break
+                for line in data[:end + 1].splitlines():
+                    try:
+                        self._ingest(json.loads(line))
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                s["offset"] += end + 1
+                self.dirty = True
+            if st.st_size > LOG_MAX_BYTES and s["offset"] >= st.st_size:
+                try:
+                    if os.stat(self.log_path).st_size == st.st_size:
+                        os.truncate(self.log_path, 0)
+                        s["offset"] = 0
+                except OSError:
+                    pass
+
+    def _ingest(self, o):
+        mid = self.host_to_id.get(o.get("h"))
+        if not mid or o.get("m") == "HEAD":
+            return
+        status, nbytes, t = int(o.get("s") or 0), int(o.get("b") or 0), float(o["t"])
+        if status >= 500:
+            delta = (0, 0, 0, 0, 1)
+        elif status in (200, 206, 304):
+            delta = (1, 0, nbytes, 0, 0) if o.get("c") in self.HIT else (0, 1, 0, nbytes, 0)
+        else:
+            return                      # 404s are normal for apt (optional index files); they are not failures
+        day = time.strftime("%Y-%m-%d", time.gmtime(t))
+        total = self.state["totals"].setdefault(mid, [0] * 5)
+        today = self.state["days"].setdefault(mid, {}).setdefault(day, [0] * 5)
+        for i, v in enumerate(delta):
+            total[i] += v
+            today[i] += v
+        days = self.state["days"][mid]
+        if len(days) > self.KEEP_DAYS + 5:
+            for old in sorted(days)[:-self.KEEP_DAYS]:
+                del days[old]
+
+    def snapshot(self):
+        with self.lock:
+            return {"days": {m: {d: list(v) for d, v in days.items()} for m, days in self.state["days"].items()},
+                    "totals": {m: list(v) for m, v in self.state["totals"].items()},
+                    "since": self.state.get("since")}
+
+    def save(self, force=False):
+        with self.lock:
+            if not self.dirty or (not force and time.time() - self.last_save < 10):
+                return
+            payload = json.dumps(self.state, separators=(",", ":"))
+            self.dirty = False
+            self.last_save = time.time()
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp, self.path)
+        except OSError:
+            with self.lock:
+                self.dirty = True
+
+
+APT_STATS = None
 
 
 # --------------------------------------------------------------------------- deleting
@@ -927,9 +1187,21 @@ def wipe_registry(regid):
 def run_delete(req):
     """Validate a delete request and carry it out. Returns a result dict."""
     scope = req.get("scope")
-    if scope not in ("tag", "repo", "registry", "all"):
-        raise ValueError("scope must be one of: tag, repo, registry, all")
+    if scope not in ("tag", "repo", "registry", "all", "apt_file", "apt_mirror", "apt_all"):
+        raise ValueError("scope must be one of: tag, repo, registry, all, apt_file, apt_mirror, apt_all")
     with _delete_lock:
+        if scope == "apt_all":
+            return apt_delete_all()
+        if scope in ("apt_file", "apt_mirror"):
+            mirror = next((m for m in parse_apt_mirrors() if m["id"] == req.get("mirror")), None)
+            if mirror is None:
+                raise NotFound("That apt mirror is not configured.")
+            name = req.get("file")
+            if scope == "apt_file":
+                if not isinstance(name, str) or not APT_FILE_RE.match(name):
+                    raise ValueError("a valid file is required")
+                return apt_delete(mirror["host"], name)
+            return apt_delete(mirror["host"])
         if scope == "all":
             total = {"images": 0, "tags": 0, "freed_bytes": 0}
             for reg in parse_registries():
@@ -1195,10 +1467,23 @@ def snapshot(wait_for=None):
         error = _state["error"]
         scanning = bool(thread and thread.is_alive())
     base = data if data is not None else {"registries": [], "disk": None, "scanned_at": None}
+    scan = base.pop("apt_scan", None) or {}
+    unlisted = base.pop("apt_unlisted_bytes", 0)
+    mirrors = []
+    for m in parse_apt_mirrors():
+        info = dict(m, files=0, disk_bytes=0, pkg_count=0, pkg_bytes=0, other_files=0, other_bytes=0,
+                    packages=[], truncated=False)
+        info.update(scan.get(m["id"], {}))
+        mirrors.append(info)
     base.update(
         scanning=scanning, error=error, ttl=CACHE_TTL, clients=load_client_names(),
         ca_available=os.path.isfile(os.path.join(PUBLIC_CERT_DIR, "ca.crt")),
         ca_fingerprint=ca_fingerprint(),
+        apt={"mirrors": mirrors, "port": apt_http_port(), "limit_bytes": apt_limit_bytes(),
+             "unlisted_bytes": unlisted, "scanned": bool(scan) or not mirrors,
+             "tracking": {"enabled": bool(APT_STATS and APT_STATS.enabled),
+                          "since": APT_STATS.state.get("since") if APT_STATS else None},
+             "stats": APT_STATS.snapshot() if APT_STATS else None},
         capabilities={"delete": ALLOW_DELETE, "token": bool(ADMIN_TOKEN)},
         tracking={"enabled": bool(TRACKER and TRACKER.enabled), "since": TRACKER.since if TRACKER else None},
         limit={"bytes": MAX_BYTES, "evict_to": int(MAX_BYTES * EVICT_TO), "last_cleanup": _last_cleanup},
@@ -1315,19 +1600,23 @@ def tracker_loop():
         try:
             TRACKER.poll()
             TRACKER.save()
+            if APT_STATS:
+                APT_STATS.poll()
+                APT_STATS.save()
         except Exception as exc:  # never let tracking take the UI down
             print(f"tracker: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(3)
 
 
 def main():
-    global TRACKER
+    global TRACKER, APT_STATS
     host_to_id = {r["upstream"]: r["id"] for r in parse_registries() if r["upstream"]}
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
     except OSError:
         pass
     TRACKER = Tracker(STATE_DIR, ACCESS_LOG, host_to_id, blob_mtime=blob_mtime)
+    APT_STATS = AptStats(STATE_DIR, APT_LOG, {m["host"]: m["id"] for m in parse_apt_mirrors()})
     try:
         TRACKER.poll()          # catch up on the log first, so the first scan knows why things are missing
     except Exception as exc:

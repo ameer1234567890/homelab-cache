@@ -8,6 +8,8 @@ docker pull quay.io/org/app     ──▶  quay.io                 ├──▶ 
 docker pull alpine              ──▶  registry-1.docker.io   ─┘      (chosen by TLS server name)
 ```
 
+The same container can also cache **apt mirrors** (Debian, Ubuntu and friends) on port 80, the same transparent way: clients keep their `sources.list` and DNS sends the mirror names here. See [Caching apt packages](#caching-apt-packages).
+
 A web UI (plain HTTP on `:8080`, and over TLS on any other name or IP) shows cached registries, images and sizes, with light and dark modes.
 
 ## What you need
@@ -15,6 +17,7 @@ A web UI (plain HTTP on `:8080`, and over TLS on any other name or IP) shows cac
 1. **DNS on the clients** that sends each registry name (`ghcr.io`, `quay.io`, …) to this server. See [Client setup](#client-setup-system-wide).
 2. **A certificate valid for those names**, trusted by the clients. You can bring your own (below) or let the container generate one.
 3. **Port 443 free** on the host (or a dedicated IP via `BIND_ADDR`). Registry URLs carry no port, so it must be 443.
+4. **Port 80 free** if you cache apt (on by default). Not needed for registries. See [Caching apt packages](#caching-apt-packages) to change or switch it off.
 
 ## Quick start
 
@@ -290,6 +293,119 @@ Add one `resolve` line per registry you want cached, for example `resolve ghcr.i
 
 Remove the DNS records or hosts line, and the certificate from the trust store (delete the file you copied, then run `sudo update-ca-certificates --fresh` or `sudo update-ca-trust`). Pulls go straight to the real registries again.
 
+## Caching apt packages
+
+The cache also keeps the `.deb` files and package lists that `apt` downloads from Debian and Ubuntu mirrors, so a second machine (or a second `apt-get install` after a rebuild) gets them over your LAN. It works like the registries: clients keep their normal `sources.list`, and DNS sends the mirror names to the cache.
+
+```
+apt update   ──▶  deb.debian.org / archive.ubuntu.com / ...  ──▶  this container :80  ──▶  cache  ──▶  real mirror
+```
+
+Unlike registry traffic, apt files are cached by nginx itself, in `data/.apt-cache`. The folder name starts with a dot so the web UI does not mistake it for a registry.
+
+### Choosing the mirrors
+
+`APT_REPOSITORIES` in `docker-compose.yml` lists them, one per line: `id | display name | upstream URL`. The default is:
+
+```
+debian|Debian|https://deb.debian.org
+debian-security|Debian security|https://security.debian.org
+ubuntu|Ubuntu|https://archive.ubuntu.com
+ubuntu-security|Ubuntu security|https://security.ubuntu.com
+ubuntu-ports|Ubuntu ports (arm and others)|https://ports.ubuntu.com
+docker|Docker|https://download.docker.com
+tailscale|Tailscale|https://pkgs.tailscale.com
+raspberrypi|Raspberry Pi OS|https://archive.raspberrypi.com
+armbian|Armbian (GitHub)|https://github.armbian.com
+armbian-netcup|Armbian (netcup)|https://netcup-02.armbian.com
+```
+
+The Docker, Tailscale, Raspberry Pi OS and Armbian repositories are included because many homelab machines use them. Their `sources.list` entries normally use `https://`, so clients need the cache's root certificate trusted (see below); the generated server certificate already covers these names. Delete the lines you do not need.
+
+- **Give only the hostname.** No path and no port: clients keep their own paths (`/debian`, `/ubuntu`). The scheme says how the cache itself talks to the mirror, and `https://` is verified against the system's trusted roots plus anything in `certs/upstream`.
+- **Add a line for every mirror name your clients use.** Cloud images often use regional names such as `us.archive.ubuntu.com`, or the provider's own mirror. Look in `/etc/apt/sources.list`, `/etc/apt/sources.list.d/` and `grep -r ^URIs /etc/apt/sources.list.d/` on a client. Other third-party repositories work the same way (`ppa|Launchpad PPAs|https://ppa.launchpadcontent.net`).
+- Hostnames must be unique across `CACHE_REGISTRIES` and `APT_REPOSITORIES`.
+- **To turn apt caching off**, comment out every line, and remove the `80:80` port line from `docker-compose.yml`.
+- **If port 80 is taken on the host**, set `APT_HTTP_PORT` (for example `8081`) in `.env`. Clients then put the port in their URLs, for example `http://deb.debian.org:8081/debian`, while the name still resolves to the cache.
+
+### Client setup
+
+Point the mirror names at the cache, the same way as for registries: a DNS record, or a line in `/etc/hosts` on each client.
+
+```
+# dnsmasq / Pi-hole
+address=/deb.debian.org/192.168.1.50
+address=/security.debian.org/192.168.1.50
+
+# or /etc/hosts
+192.168.1.50  deb.debian.org security.debian.org archive.ubuntu.com security.ubuntu.com ports.ubuntu.com
+192.168.1.50  download.docker.com pkgs.tailscale.com archive.raspberrypi.com github.armbian.com netcup-02.armbian.com
+```
+
+The web UI's **Connect a client** button shows these same instructions for your actual mirror names, address and port, with copy buttons. Nothing else changes: apt keeps using `http://` on port 80, which needs no certificate. Then:
+
+```bash
+sudo apt-get update && sudo apt-get install -y htop
+```
+
+> The client setup script (`setup.sh`) manages one block in `/etc/hosts` and replaces it each time it runs, so do not use it for the apt names. If you use it for the registries, add the apt names as a separate line outside its block.
+
+**Sources that use `https://`** (Debian images that ship `https://deb.debian.org`, most third-party repositories) connect to the cache on port 443, so the client must trust the cache's root certificate (see [Client setup](#client-setup-system-wide)) and the server certificate must list the mirror name. A generated certificate already does. If you provide your own, add the mirror names to it, otherwise only `http://` sources work. The start-up log prints a note for each mirror your certificate does not cover.
+
+### Check that it works
+
+Ask for a small file twice. The first request is a `MISS` (fetched from the mirror), the second a `HIT`:
+
+```bash
+curl -sI http://deb.debian.org/debian/dists/stable/InRelease | grep -i x-cache-status
+curl -sI http://deb.debian.org/debian/dists/stable/InRelease | grep -i x-cache-status
+```
+
+`X-Cache-Status` is on every apt response: `MISS`, `HIT`, `EXPIRED` (the mirror was asked and sent a new copy), `REVALIDATED` (the mirror was asked and the copy was still current), `STALE` (the mirror could not be reached, so the old copy was served), or `UPDATING` (a stale copy served while another request refreshes it). If it is always `MISS`, or the headers are missing, the name probably resolves to the real mirror and not to the cache: check with `getent hosts deb.debian.org`.
+
+### If packages are not being cached
+
+Index files (`InRelease`, `Packages.xz`) cached but no `.deb` files? Request one package file twice and look at the headers. Use any `.deb` that exists on your mirror (find one with `apt-get install --print-uris -y htop`), with the client's real mirror name:
+
+```bash
+URL=http://deb.debian.org/debian/pool/main/h/htop/htop_3.2.2-2_amd64.deb
+curl -s -o /dev/null -D - $URL | grep -iE '^(HTTP|x-cache-status|x-upstream-status|location|content-length)'
+curl -s -o /dev/null -D - $URL | grep -iE '^(HTTP|x-cache-status|x-upstream-status|location|content-length)'
+```
+
+The second answer should say `X-Cache-Status: HIT`. If not:
+
+| You see | It means | What to do |
+| --- | --- | --- |
+| No `X-Cache-Status` header at all | The request did not reach the cache; the name resolves to the real mirror, or something else answers on that port | Check `getent hosts <mirror name>` on the client points at the cache |
+| `HTTP/1.1 301`, `302`, `307` or `308` with a `Location:` header | The mirror redirects package downloads to another server, and the client then fetches from that server directly, so the cache never sees the file | Use a different mirror name for that repository, one that serves files itself |
+| `X-Upstream-Status: 403`, `404`, `429` or `5xx` | The mirror refused or failed the request | Try the same URL with `curl` on a machine without the cache |
+| `X-Cache-Status: MISS` both times, status `200` | The response was not stored | Look for `[error]` or `[crit]` lines from nginx in `docker compose logs homelab-cache` (for example a full disk or a permission error on `data/.apt-cache`) and report them |
+| `HIT` on the second request | It works; packages you installed earlier came from a mirror name that is not in `APT_REPOSITORIES`, or from `https://` before the certificate was trusted | Compare the `URIs:` / `deb` lines in the client's apt sources with the mirror list |
+
+Also check that the machine really installs through the cache: `apt-get install --print-uris -y <package>` prints the URL each package comes from. The host in those URLs must be one of the mirrors in `APT_REPOSITORIES`.
+
+### How long files are kept
+
+- **Package files** (`.deb`, `.udeb`, source tarballs, anything under `by-hash/`) never change once published, so they are served from the cache for `APT_PACKAGE_TTL` (default `30d`) before the mirror is asked again.
+- **Everything else** (`InRelease`, `Release`, `Packages.xz`, `Sources`, `Contents`, ...) changes whenever the mirror updates, so it is served for only `APT_INDEX_TTL` (default `5m`). After that, the cache asks the mirror whether the file changed, a small request that usually returns "not modified". New security updates therefore show up within minutes.
+- **Mirror down?** The cache serves what it has, even if it has expired.
+- **Several clients, one new package:** only one download goes to the mirror; the others wait for it and share the result.
+- Files nobody has asked for in 90 days are removed.
+
+### Size limit
+
+`APT_MAX_SIZE` caps the apt cache (`20GB`, `500MB`, `1.5TB`, `20GiB`, same format as `CACHE_MAX_SIZE`). Over it, nginx removes the least recently used files. Empty means no limit, which is the default. It is separate from `CACHE_MAX_SIZE`, which only counts registry images.
+
+### What to know
+
+- **apt has its own entries in the web UI** (see [apt in the web UI](#apt-in-the-web-ui)), but it is separate from the registries: it does not appear in "All registries", the strip of largest images or "Delete entire docker cache" (which has its own "Delete entire apt cache" button next to it), and it does not count toward `CACHE_MAX_SIZE`. Its limit is `APT_MAX_SIZE`.
+- **Clear it:** `docker compose stop && rm -rf data/.apt-cache && docker compose start`.
+- **Only the names in `APT_REPOSITORIES` are cached.** A mirror that is not listed still works if the client resolves it to the real address, but is not cached. If a client resolves an unlisted name to the cache, it gets the web UI instead.
+- **`HTTP_PROXY` and `HTTPS_PROXY` do not apply to apt.** nginx connects to the mirrors directly, using the container's DNS (`UPSTREAM_DNS`). Registry traffic is unaffected.
+- **Not a replacement for a full mirror.** It caches what your machines ask for. It does not know what a mirror has removed, so a package withdrawn upstream can be served for up to `APT_PACKAGE_TTL`.
+- **Anything on these hostnames goes through the cache.** A browser that resolves `deb.debian.org` to the cache sees the mirror's pages, cached with the same rules.
+
 ## The web UI
 
 - Total cache size, free space on the volume, and a scale drawing of the largest images.
@@ -297,12 +413,29 @@ Remove the DNS records or hosts line, and the certificate from the trust store (
 - **How well it works:** bandwidth saved, hit rate and a daily chart, for the whole cache or one registry ([details below](#cache-performance)).
 - **Who pulled it:** for every tag, which host requested it first and which hosts pulled it afterwards ([details below](#who-pulled-what)).
 - **Why something is missing:** when a platform or layer is not cached, the reason is shown next to it ([details below](#why-some-layers-are-not-cached)).
-- **Deleting:** remove one tag, a whole image, everything from one registry, or the entire cache, each behind a warning dialog ([details below](#deleting-from-the-cache)).
+- **Deleting:** remove one tag, a whole image, everything from one registry, the entire docker cache or the entire apt cache, each behind a warning dialog ([details below](#deleting-from-the-cache)).
+- **apt mirrors:** each mirror has its own entry in the list. Select it to see the cached packages, the size on disk and the same cache performance panel ([details below](#apt-in-the-web-ui)).
 - **Light and dark mode.** The toggle is saved in the browser (`localStorage`); with no saved choice the UI follows your operating system.
 
 Sizes are read straight from the registries' storage, because the tag API of a pull-through registry asks the upstream and cannot say what is cached locally. They are compressed bytes on disk. A multi-arch tag counts only platforms that have actually been pulled. The large headline number is real disk usage, so layers shared between images count once there; per-image sizes can add up to more.
 
 The table lists tagged images. Content that was only ever pulled by digest (`image@sha256:...`, common in Kubernetes manifests) is cached and counts toward the totals, but has no tag to show. The registry and whole-cache delete operations do remove it.
+
+### apt in the web UI
+
+Under **apt mirrors** in the list on the left there is one entry per mirror in `APT_REPOSITORIES`, with its size and number of cached packages. With two or more mirrors, an **All apt mirrors** entry at the top adds them all up: one list of every cached package (with a Mirror column, searchable by mirror name too), combined statistics and a single **Delete entire apt cache** button. Select a mirror, or All apt mirrors, to see:
+
+- **The cached packages**: name, version, architecture, size and when the cache stored it, searchable and sortable. A package is a `.deb`, `.udeb` or `.ddeb` file. Everything else the mirror serves (`InRelease`, `Packages.xz`, `by-hash` files) is counted as **index files** in one line under the table, because apt refreshes those by itself.
+- **Cache performance** for that mirror: bandwidth saved, hit rate and the daily chart, the same as for registries. The numbers come from nginx's own cache status for every request. A hit is any request the cache answered, including index files that were re-checked with the mirror and found unchanged. Requests for files that do not exist are not counted, and neither are `HEAD` requests.
+- **The apt size limit**, if `APT_MAX_SIZE` is set: one meter for all mirrors together.
+- **Deleting**: one package, or everything cached for the mirror. Statistics are kept.
+
+How it works: nginx writes one JSON line per apt request to `data/.registry-cache/apt-access.log`, and the UI reads it the same way as the registry log and keeps its totals in `apt-stats.json` next to it. The package list comes from nginx's cache folder (`data/.apt-cache`) itself: every cached file starts with the request it answers, so nothing else has to be recorded.
+
+- **Cached** is the time the file was stored or last re-checked with the mirror, whichever is later, not the date the mirror published the package.
+- **At most 2000 packages** per mirror are listed (the newest). The count above the list is always complete.
+- **Deleting is immediate.** nginx notices the missing file the next time a client asks for it and fetches it from the mirror again.
+- **Only mirrors in `APT_REPOSITORIES` are listed.** Files cached for a mirror that you have since removed from the list still use disk space and count toward the limit, but they are not shown. Clear them with `rm -rf data/.apt-cache` (container stopped) if you do not need them.
 
 ### Who pulled what
 
@@ -352,14 +485,17 @@ The failure and expiry reasons come from the request history above, so they appl
 
 ### Deleting from the cache
 
-Four operations, each with its own confirmation dialog that explains what will be removed, how much space is freed, and that it cannot be undone:
+These operations each have their own confirmation dialog that explains what will be removed, how much space is freed, and that it cannot be undone:
 
 | Operation                    | Where                                                        | Extra safeguard                       |
 | ---------------------------- | ------------------------------------------------------------ | ------------------------------------- |
 | Delete one tag               | Trash icon on a tag row                                      |                                       |
 | Delete an image (all tags)   | Trash icon on the image row                                  |                                       |
 | Delete everything in a registry | Select the registry, then **Delete all in ...**           | Tick "I understand" to enable Delete  |
-| Delete the entire cache      | Select **All registries**, then **Delete entire cache**      | Tick "I understand" to enable Delete  |
+| Delete the entire docker cache | Select **All registries**, then **Delete entire docker cache** | Tick "I understand" to enable Delete |
+| Delete one apt package       | Select the mirror, then the trash icon on a package row      |                                       |
+| Delete everything for an apt mirror | Select the mirror, then **Delete all in ...**         | Tick "I understand" to enable Delete  |
+| Delete the entire apt cache  | Select **All registries**, any apt mirror or **All apt mirrors**, then **Delete entire apt cache** | Tick "I understand" to enable Delete |
 
 Cancel is focused by default, so pressing Enter in the dialog never deletes.
 
@@ -407,6 +543,10 @@ Set in `.env` (see `.env.example`).
 | `REGISTRY_IMAGE`               | `ameer1234567890/homelab-cache:latest` | The image to run                                   |
 | `BIND_ADDR`                    | `0.0.0.0`          | Interface the cache listens on (port 443)                                |
 | `UI_PORT`                      | `8080`             | Plain-HTTP web UI                                                        |
+| `APT_HTTP_PORT`                | `80`               | Host port for the plain-HTTP apt mirrors                                  |
+| `APT_INDEX_TTL`                | `5m`               | How long apt index files are served before the mirror is asked again      |
+| `APT_PACKAGE_TTL`              | `30d`              | How long `.deb` files are served before the mirror is asked again         |
+| `APT_MAX_SIZE`                 | _(empty)_          | Size limit of the apt cache, such as `20GB` (empty = no limit)            |
 | `UPSTREAM_DNS`, `UPSTREAM_DNS_2` | `1.1.1.1`, `8.8.8.8` | Resolvers the cache uses to reach the real registries (see warning below) |
 | `HTTPS_PROXY`, `NO_PROXY`      | _(empty)_          | Outbound proxy for the cache's own upstream traffic                      |
 | `CERTS_DIR`                    | `./certs`          | Your `server.crt`, `server.key`, optional `ca.crt`                       |
@@ -462,10 +602,12 @@ The image is now built on registry 3, which may print different start-up message
 
 - **Clear a registry or the whole cache:** use the delete buttons in the UI. From the command line: `docker compose stop && rm -rf data/ghcr/docker && docker compose start`.
 - **Reclaim space from removed manifests:** `docker compose exec homelab-cache registry garbage-collect /run/registry/hub.yml`
+- **Clear the apt cache:** `docker compose stop && rm -rf data/.apt-cache && docker compose start`
 - **Logs:** `docker compose logs -f homelab-cache`
 
 ## Limitations
 
+- **apt is cached by file, not by package.** It is listed in the web UI under its own heading, apart from the registries, and has its own size limit (`APT_MAX_SIZE`). See [Caching apt packages](#caching-apt-packages).
 - **A name pointed at the cache is only a registry for those clients.** Anything else at that name (for example the quay.io website in a browser) will not work from a client that resolves it to the cache. Registry API traffic (`/v2/…`) is unaffected.
 - Registry names that are not in `CACHE_REGISTRIES` (for example `us.gcr.io`, `docker.elastic.co`) are not cached. Add a line for each one you use. Wildcard hosts need one entry per hostname.
 - Pull-through only; pushing is not possible by design.
