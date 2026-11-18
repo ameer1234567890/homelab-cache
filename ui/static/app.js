@@ -508,6 +508,20 @@
     return `<div class="plats">${html}</div>`;
   }
 
+  // apt: who made the cache fetch this package from the mirror, and who used the cached copy afterwards.
+  function aptActivityCell(mid, p) {
+    const apt = state.data.apt;
+    if (!(apt.tracking && apt.tracking.enabled)) return '<span class="muted">not tracked</span>';
+    const a = p.activity;
+    if (!a || (!a.initial && !a.later_total)) return '<span class="muted">none recorded</span>';
+    const who = a.initial ? esc(hostLabel(a.initial)) : 'Not recorded';
+    const more = a.later_total
+      ? `${plural(a.later_total, 'later use')} from ${plural(a.later_hosts, 'host')}`
+      : 'not used again';
+    return `<button class="linkbtn" type="button" data-apt-hosts="${esc(`${mid}|${p.file}`)}">
+      <span class="who-main">${who}</span><span class="sub">${more}</span></button>`;
+  }
+
   function activityCell(row, t) {
     if (!tracking().enabled) return '<span class="muted">not tracked</span>';
     const a = t.activity;
@@ -570,11 +584,12 @@
         ${m.all ? `<td class="hide-md">${esc(p.mirrorName)}</td>` : ''}
         <td class="hide-sm">${chips([p.arch])}</td>
         <td class="num"><span class="sizecell"><span class="bar" style="--c:${color}"><i style="width:${(p.size / max) * 100}%"></i></span>${fmtBytes(p.size)}</span></td>
+        <td>${aptActivityCell(mid, p)}</td>
         <td class="num" title="${esc(absTime(p.cached))}">${ago(p.cached)}</td>
         <td class="act">${deleteButton('apt_file', mid, p.file, '', `Delete ${p.name} ${p.version} from the cache`)}</td>
       </tr>`;
     }).join('');
-    el.innerHTML = `<table><thead><tr>${th('name', 'Package')}<th>Version</th>${m.all ? '<th class="hide-md">Mirror</th>' : ''}<th class="hide-sm">Architecture</th>${th('size', 'Size', 'num')}${th('updated', 'Cached', 'num')}<th class="act"></th></tr></thead><tbody>${body}</tbody></table>${noteHtml}`;
+    el.innerHTML = `<table><thead><tr>${th('name', 'Package')}<th>Version</th>${m.all ? '<th class="hide-md">Mirror</th>' : ''}<th class="hide-sm">Architecture</th>${th('size', 'Size', 'num')}<th>First requested by</th>${th('updated', 'Cached', 'num')}<th class="act"></th></tr></thead><tbody>${body}</tbody></table>${noteHtml}`;
   }
 
   function renderTable() {
@@ -839,6 +854,48 @@
       Give addresses friendly names in <code>clients.conf</code>.${since ? ` Tracking has been recording since ${esc(absDate(since))}.` : ''}</p>`);
   }
 
+  /* ---- apt: who requested a package, who used it later */
+  async function openAptHosts(key) {
+    const [mirrorId, file] = key.split('|');
+    const m = aptMirrors().find((x) => x.id === mirrorId);
+    const p = m && m.packages.find((x) => x.file === file);
+    if (!p) return;
+    const since = state.data.apt.tracking && state.data.apt.tracking.since;
+    let a;
+    try {
+      const res = await fetch(`/api/apt/activity?file=${encodeURIComponent(file)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      a = await res.json();
+    } catch (err) {
+      toast(`Could not load the request history: ${err.message}`);
+      return;
+    }
+    const initial = a.initial
+      ? `<div class="who">
+           <div class="who-name">${esc(hostLabel(a.initial))}</div>
+           ${a.initial.name ? `<p class="muted">${esc(a.initial.ip)}</p>` : ''}
+           <p>${esc(absTime(a.initial.t))}, ${ago(a.initial.t)}${a.initial.ua ? `, using ${esc(a.initial.ua)}` : ''}</p>
+         </div>`
+      : `<p class="note warn-note">The request that first cached this package was not recorded. It was probably cached before tracking started${since ? ` on ${esc(absDate(since))}` : ''}, or its log entry has since been rotated away. Later uses are still listed below.</p>`;
+    const later = a.later.length
+      ? `<div class="table-wrap"><table class="mini"><thead><tr><th>Host</th><th class="num">Requests</th><th>Last request</th><th>Client</th></tr></thead><tbody>
+          ${a.later.map((h) => `<tr>
+            <td>${esc(hostLabel(h))}${h.name ? `<div class="muted">${esc(h.ip)}</div>` : ''}</td>
+            <td class="num">${h.n}</td>
+            <td title="${esc(absTime(h.last))}">${ago(h.last)}</td>
+            <td>${h.ua ? esc(h.ua) : '<span class="muted">unknown</span>'}</td></tr>`).join('')}
+        </tbody></table></div>`
+      : '<p class="muted">No one has requested it again since.</p>';
+    showDialog('#info', 'info-title', `Request history for ${esc(p.name)} ${esc(p.version)}`, `
+      <p>${esc(m.name)}, ${esc(p.arch)}. The first request is the one that made the cache download the package from the mirror.
+      Every later request was answered from the cache without contacting the mirror.</p>
+      <h3>First requested by</h3>${initial}
+      <h3>Later uses, served from the cache${a.later_total ? ` (${a.later_total})` : ''}</h3>${later}
+      <p class="note">Hosts are the client addresses the cache saw. Behind a NAT or another proxy they can show that device's address instead.
+      Give addresses friendly names in <code>clients.conf</code>.${since ? ` Tracking has been recording since ${esc(absDate(since))}.` : ''}
+      If the cache fetched the package again after it expired, only requests since then are listed.</p>`);
+  }
+
   /* ---- why layers are missing */
   function openGaps(key) {
     const [regId, repoName, tagName] = key.split('|');
@@ -1002,7 +1059,7 @@
   }
 
   document.addEventListener('click', (e) => {
-    const t = e.target.closest('[data-reg],[data-toggle],[data-sort],[data-copy],[data-seg],[data-action],[data-hosts],[data-gaps],[data-del-scope],[data-range]');
+    const t = e.target.closest('[data-reg],[data-toggle],[data-sort],[data-copy],[data-seg],[data-action],[data-hosts],[data-apt-hosts],[data-gaps],[data-del-scope],[data-range]');
     if (!t) return;
     if (t.dataset.reg !== undefined) { state.reg = t.dataset.reg; render(); }
     else if (t.dataset.toggle !== undefined) {
@@ -1022,6 +1079,7 @@
       try { localStorage.setItem(RANGE_KEY, state.range); } catch (err) { /* storage blocked */ }
       renderStats();
     } else if (t.dataset.hosts) openHosts(t.dataset.hosts);
+    else if (t.dataset.aptHosts) openAptHosts(t.dataset.aptHosts);
     else if (t.dataset.gaps) openGaps(t.dataset.gaps);
     else if (t.dataset.delScope) {
       const sc = t.dataset.delScope;

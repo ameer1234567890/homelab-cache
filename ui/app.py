@@ -23,7 +23,7 @@ import ssl
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PUBLIC_CERT_DIR = os.environ.get("PUBLIC_CERT_DIR", "/run/public-certs")
@@ -827,7 +827,9 @@ def scan_all():
         disk = {"total": usage.total, "used": usage.used, "free": usage.free}
     except OSError:
         pass
-    apt_scan, apt_unlisted = scan_apt(parse_apt_mirrors())
+    apt_scan, apt_unlisted, apt_present = scan_apt(parse_apt_mirrors())
+    if APT_STATS:
+        APT_STATS.prune(apt_present)
     return {"registries": regs, "disk": disk, "scanned_at": time.time(),
             "apt_scan": apt_scan, "apt_unlisted_bytes": apt_unlisted,
             "scan_seconds": round(time.time() - started, 2)}
@@ -902,6 +904,7 @@ def scan_apt(mirrors):
     out = {m["id"]: {"files": 0, "disk_bytes": 0, "pkg_count": 0, "pkg_bytes": 0,
                      "other_files": 0, "other_bytes": 0, "packages": []} for m in mirrors}
     unlisted = 0
+    present = set()
     for name, path in apt_cache_files():
         try:
             size = os.stat(path)
@@ -917,6 +920,7 @@ def scan_apt(mirrors):
         rec["disk_bytes"] += size.st_size
         pkg = APT_PKG_RE.match(unquote(posixpath.basename(key[1])))
         if pkg:
+            present.add(name)
             rec["pkg_count"] += 1
             rec["pkg_bytes"] += size.st_size
             rec["packages"].append({"file": name, "name": pkg.group(1), "version": pkg.group(2),
@@ -928,7 +932,7 @@ def scan_apt(mirrors):
         rec["packages"].sort(key=lambda p: p["cached"], reverse=True)
         rec["truncated"] = rec["pkg_count"] > APT_MAX_PACKAGES
         del rec["packages"][APT_MAX_PACKAGES:]
-    return out, unlisted
+    return out, unlisted, present
 
 
 def apt_delete_all():
@@ -943,6 +947,8 @@ def apt_delete_all():
         files += 1
         freed += size
     _apt_keys.clear()
+    if APT_STATS:
+        APT_STATS.forget_all()
     return {"files": files, "freed_bytes": freed}
 
 
@@ -962,6 +968,8 @@ def apt_delete(host, only=None):
         files += 1
         freed += size
         _apt_keys.pop(name, None)
+        if APT_STATS:
+            APT_STATS.forget(name)
     if only and not files:
         raise NotFound("That file is no longer in the apt cache.")
     return {"files": files, "freed_bytes": freed}
@@ -979,7 +987,8 @@ class AptStats:
         self.path = os.path.join(state_dir, "apt-stats.json")
         self.lock = threading.Lock()
         self.dirty, self.last_save = False, 0.0
-        self.state = {"v": 1, "since": time.time(), "offset": 0, "inode": 0, "days": {}, "totals": {}}
+        self.state = {"v": 1, "since": time.time(), "offset": 0, "inode": 0, "days": {}, "totals": {},
+                      "files": {}, "uas": {}}
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 loaded = json.load(fh)
@@ -987,6 +996,8 @@ class AptStats:
                 self.state.update(loaded)
         except (OSError, ValueError):
             pass
+        self.state.setdefault("files", {})
+        self.state.setdefault("uas", {})
 
     @property
     def enabled(self):
@@ -1028,6 +1039,7 @@ class AptStats:
         if not mid or o.get("m") == "HEAD":
             return
         status, nbytes, t = int(o.get("s") or 0), int(o.get("b") or 0), float(o["t"])
+        self._who(o, mid, status, t)
         if status >= 500:
             delta = (0, 0, 0, 0, 1)
         elif status in (200, 206, 304):
@@ -1044,6 +1056,84 @@ class AptStats:
         if len(days) > self.KEEP_DAYS + 5:
             for old in sorted(days)[:-self.KEEP_DAYS]:
                 del days[old]
+
+    UA_APT = re.compile(r"APT-HTTP/[\d.]+ \(([^)]+)\)")
+
+    def _who(self, o, mid, status, t):
+        """Remember which client filled the cache with a package and which clients used it afterwards.
+        A package is keyed by the name of its cache file, which is the md5 of what nginx keys it by."""
+        uri = str(o.get("u") or "")
+        base = unquote(posixpath.basename(uri.split("?", 1)[0]))
+        if status not in (200, 206, 304) or not APT_PKG_RE.match(base):
+            return
+        ip = str(o.get("ip") or "")
+        if not ip:
+            return
+        ua = str(o.get("ua") or "")
+        apt = self.UA_APT.search(ua)
+        self.state["uas"][ip] = ("apt " + apt.group(1)) if apt else (ua.split(" ")[0][:40] or "")
+        name = hashlib.md5((str(o.get("h")) + uri).encode("utf-8", "replace")).hexdigest()
+        rec = self.state["files"].setdefault(name, {"f": None, "l": {}})
+        status_text = o.get("c")
+        if status_text in ("MISS", "EXPIRED", "BYPASS"):
+            rec["f"], rec["l"] = [t, ip], {}              # the mirror was asked: a new copy, and this client caused it
+        elif status_text in self.HIT:
+            use = rec["l"].setdefault(ip, [0, t, t])       # [requests, first, last]
+            use[0] += 1
+            use[2] = max(use[2], t)
+
+    def activity(self, name, names):
+        """Who filled the cache with this package, and who used it afterwards."""
+        with self.lock:
+            rec = self.state["files"].get(name)
+            uas = dict(self.state["uas"])
+            if not rec:
+                return {"initial": None, "later": [], "later_total": 0}
+            first, uses = rec["f"], {ip: list(v) for ip, v in rec["l"].items()}
+
+        def who(ip):
+            return {"ip": ip, "name": names.get(ip), "ua": uas.get(ip) or None}
+
+        later = [dict(who(ip), n=v[0], first=v[1], last=v[2]) for ip, v in uses.items()]
+        later.sort(key=lambda h: h["last"], reverse=True)
+        return {"initial": dict(who(first[1]), t=first[0]) if first else None,
+                "later": later, "later_total": sum(h["n"] for h in later)}
+
+    def summary(self, name, names):
+        """The short form shown in the package list."""
+        with self.lock:
+            rec = self.state["files"].get(name)
+            if not rec:
+                return None
+            first, uses = rec["f"], rec["l"]
+            total, hosts = sum(v[0] for v in uses.values()), len(uses)
+        initial = None
+        if first:
+            initial = {"ip": first[1], "name": names.get(first[1]), "t": first[0]}
+        return {"initial": initial, "later_total": total, "later_hosts": hosts}
+
+    def forget(self, name):
+        with self.lock:
+            if self.state["files"].pop(name, None) is not None:
+                self.dirty = True
+
+    def forget_all(self):
+        with self.lock:
+            self.state["files"] = {}
+            self.dirty = True
+
+    def prune(self, present):
+        """Drop records of packages that left the cache (expired or evicted), keeping very recent ones that nginx
+        may still be writing."""
+        cutoff = time.time() - 3600
+        with self.lock:
+            files = self.state["files"]
+            for name in [n for n in files if n not in present]:
+                rec = files[name]
+                last = max([rec["f"][0] if rec["f"] else 0] + [v[2] for v in rec["l"].values()])
+                if last < cutoff:
+                    del files[name]
+                    self.dirty = True
 
     def snapshot(self):
         with self.lock:
@@ -1470,10 +1560,13 @@ def snapshot(wait_for=None):
     scan = base.pop("apt_scan", None) or {}
     unlisted = base.pop("apt_unlisted_bytes", 0)
     mirrors = []
+    client_names = load_client_names()
     for m in parse_apt_mirrors():
         info = dict(m, files=0, disk_bytes=0, pkg_count=0, pkg_bytes=0, other_files=0, other_bytes=0,
                     packages=[], truncated=False)
         info.update(scan.get(m["id"], {}))
+        if APT_STATS:
+            info["packages"] = [dict(p, activity=APT_STATS.summary(p["file"], client_names)) for p in info["packages"]]
         mirrors.append(info)
     base.update(
         scanning=scanning, error=error, ttl=CACHE_TTL, clients=load_client_names(),
@@ -1533,6 +1626,14 @@ class Handler(BaseHTTPRequestHandler):
             # Block only for the very first scan; afterwards serve the last result at once
             # while a stale cache is rescanned in the background.
             return self._json(snapshot(thread if _state["data"] is None else None))
+        if route == "/api/apt/activity":
+            query = parse_qs(urlparse(self.path).query)
+            name = (query.get("file") or [""])[0]
+            if not APT_FILE_RE.match(name) or APT_STATS is None:
+                return self._json({"error": "a valid file is required"}, 400)
+            result = APT_STATS.activity(name, load_client_names())
+            result["since"] = APT_STATS.state.get("since")
+            return self._json(result)
         if route == "/setup.sh":
             try:
                 script = render_client_setup(self.headers.get("Host"), self.headers.get("X-Forwarded-Proto", "http"))

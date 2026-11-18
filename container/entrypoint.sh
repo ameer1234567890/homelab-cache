@@ -279,8 +279,8 @@ if [ "$apt_n" -gt 0 ]; then
   apt_max=""; [ -z "$apt_mb" ] || apt_max=" max_size=${apt_mb}m"
   {
     echo "# apt mirrors (APT_REPOSITORIES): one shared cache, keyed by mirror name and path."
-    # One short line per apt request: which mirror, whether the cache answered, how many bytes. The web UI reads it for statistics.
-    echo 'log_format apt_json escape=json '"'"'{"t":$msec,"h":"$server_name","m":"$request_method","u":"$uri","s":$status,"b":$body_bytes_sent,"c":"$upstream_cache_status"}'"'"';'
+    # One short line per apt request: who asked, for what, whether the cache answered, how many bytes. The web UI reads it for statistics and for who fetched and used each package.
+    echo 'log_format apt_json escape=json '"'"'{"t":$msec,"ip":"$remote_addr","h":"$server_name","m":"$request_method","u":"$request_uri","s":$status,"b":$body_bytes_sent,"c":"$upstream_cache_status","ua":"$http_user_agent"}'"'"';'
     echo "proxy_cache_path ${APT_DIR} levels=1:2 keys_zone=apt:50m inactive=90d use_temp_path=off${apt_max};"
     echo "resolver${resolvers} valid=300s ipv6=off;"
     echo "resolver_timeout 10s;"
